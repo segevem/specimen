@@ -642,7 +642,11 @@ def deriveConstrainedProducer
   let rec mkProdType : List Expr → TermElabM Expr
     | [] => throwError "no output types"
     | [t] => pure t
-    | t :: ts => do let rest ← mkProdType ts; mkAppM ``Prod #[t, rest]
+    | t :: ts => do
+      let rest ← mkProdType ts
+      let u ← Meta.mkFreshLevelMVar
+      let v ← Meta.mkFreshLevelMVar
+      pure (Lean.mkApp2 (Lean.mkConst ``Prod [u, v]) t rest)
   let outputType ← mkProdType outputTypes.toList
 
   -- Add the name & type of each argument of the inductive relation to the `LocalContext`
@@ -792,10 +796,17 @@ def compileInductiveSchedule (indSched : InductiveSchedule)
       match argTypesLive[i]? with | some ty => !ty.isSort | none => true)
     let outputTypes := outputIndicesNonSort.filterMap (fun i => argTypesLive[i]?)
     -- Compile each constructor schedule to a sub-producer term
+    -- Use mkApp2 with fresh level mvars instead of mkAppM to avoid "Application type mismatch"
+    -- when output types live in Sort u (e.g., Eq's α parameter). The Expr is only delabbed
+    -- to syntax later, so exact universe levels don't need to be solved here.
     let rec mkProdType : List Expr → TermElabM Expr
       | [] => throwError "no output types"
       | [t] => pure t
-      | t :: ts => do let rest ← mkProdType ts; mkAppM ``Prod #[t, rest]
+      | t :: ts => do
+        let rest ← mkProdType ts
+        let u ← Meta.mkFreshLevelMVar
+        let v ← Meta.mkFreshLevelMVar
+        pure (Lean.mkApp2 (Lean.mkConst ``Prod [u, v]) t rest)
     let outputType ← if key.deriveSort == .Checker then
         pure (Lean.mkConst ``Bool)
       else
@@ -952,7 +963,11 @@ partial def deriveBestInductiveSchedule (key : SpecKey)
             let outputTypes ← outputFVars.mapM (fun e => inferType e)
             let rec mkProdTypeExpr : List Expr → TermElabM Expr
               | [] => throwError "empty" | [t'] => pure t'
-              | t' :: ts => do let rest ← mkProdTypeExpr ts; mkAppM ``Prod #[t', rest]
+              | t' :: ts => do
+                let rest ← mkProdTypeExpr ts
+                let u ← Meta.mkFreshLevelMVar
+                let v ← Meta.mkFreshLevelMVar
+                pure (Lean.mkApp2 (Lean.mkConst ``Prod [u, v]) t' rest)
             let outType ← mkProdTypeExpr outputTypes
             withLocalDecl `x .default outType fun xFvar => do
               let mut projections : Array Expr := #[]
@@ -1196,7 +1211,11 @@ def deriveConstrainedProducerParts
   let rec mkProdType : List Expr → TermElabM Expr
     | [] => throwError "no output types"
     | [t] => pure t
-    | t :: ts => do let rest ← mkProdType ts; mkAppM ``Prod #[t, rest]
+    | t :: ts => do
+      let rest ← mkProdType ts
+      let u ← Meta.mkFreshLevelMVar
+      let v ← Meta.mkFreshLevelMVar
+      pure (Lean.mkApp2 (Lean.mkConst ``Prod [u, v]) t rest)
   let _outputType ← mkProdType outputTypes.toList
   let (baseProducers, inductiveProducers, freshenedOutputNames, freshArgIdents, localCtx) ←
     withLocalDeclsDND argNamesTypes (fun _ => do
