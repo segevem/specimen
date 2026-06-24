@@ -1926,7 +1926,14 @@ def elabDeriveMutual : CommandElab := fun stx => do
                 if indSched.alreadyExists then "(pre-existing)"
                 else s!"({indSched.baseSchedules.length} base, {indSched.recSchedules.length} rec)"
               | _ => ""
-            pure s!"{k.prettyPrint numArgs} {scoreStr}"
+            let constraintStr : String := match constraintMap[k]? with
+              | some cs =>
+                if cs.isEmpty then ""
+                else
+                  let names : Array String := cs.map Name.getString!
+                  " {" ++ String.intercalate ", " names.toList ++ "}"
+              | none => ""
+            pure s!"{k.prettyPrint numArgs}{constraintStr} {scoreStr}"
           let richOutput := Lean.Option.get (← getOptions) specimen.richOutput
           if defCmds.size > 1 then
             if !richOutput then logInfo m!"  ◆ mutual ({defCmds.size}):\n    {String.intercalate "\n    " specDescs}"
@@ -2053,9 +2060,15 @@ def elabDeriveMutual : CommandElab := fun stx => do
                       ]
                     ]]
                   | none => #[]
+                let csStr : String := match constraintMap[k]? with
+                  | some cs => if cs.isEmpty then ""
+                    else let ns : Array String := cs.map Name.getString!
+                         " {" ++ String.intercalate ", " ns.toList ++ "}"
+                  | none => ""
                 mutualItems := mutualItems.push (Html.element "details" #[] #[
                   .element "summary" #[("style", json% {"cursor": "pointer", "marginBottom": "2px"})] #[
                     mkSpan specNameStyle (k.prettyPrint numArgs),
+                    mkSpan (json% {"color": "#4ec9b0", "fontSize": "0.85em"}) csStr,
                     mkSpan scoreStyle s!" ({nCtors} ctors{timeStr}) score: {indScoreStr}"
                   ],
                   .element "div" #[("style", json% {"marginLeft": "12px"})] (ctorItems ++ codeItem)
@@ -2092,10 +2105,16 @@ def elabDeriveMutual : CommandElab := fun stx => do
                       ]
                     ]]
                   | none => #[]
+                let csStr : String := match constraintMap[k]? with
+                  | some cs => if cs.isEmpty then ""
+                    else let ns : Array String := cs.map Name.getString!
+                         " {" ++ String.intercalate ", " ns.toList ++ "}"
+                  | none => ""
                 orderItems := orderItems.push (Html.element "details" #[] #[
                   .element "summary" #[("style", json% {"cursor": "pointer", "marginBottom": "2px"})] #[
                     .text "● ",
                     mkSpan specNameStyle (k.prettyPrint numArgs),
+                    mkSpan (json% {"color": "#4ec9b0", "fontSize": "0.85em"}) csStr,
                     mkSpan scoreStyle s!" ({nCtors} ctors{timeStr}) score: {indScoreStr}"
                   ],
                   .element "div" #[("style", json% {"marginLeft": "12px"})] (ctorItems ++ codeItem)
@@ -2273,7 +2292,12 @@ def elabDeriveMutual : CommandElab := fun stx => do
                 match finalMemo[k]? with
                 | some (.done indSched) =>
                   let nCtors := indSched.baseSchedules.length + indSched.recSchedules.length
-                  lines := lines.push s!"    {specQuality indSched} {k.prettyPrint numArgs} ({nCtors} ctors) [{bundle.reprScore indSched.score}]"
+                  let csStr : String := match constraintMap[k]? with
+                    | some cs => if cs.isEmpty then ""
+                      else let ns : Array String := cs.map Name.getString!
+                           " {" ++ String.intercalate ", " ns.toList ++ "}"
+                    | none => ""
+                  lines := lines.push s!"    {specQuality indSched} {k.prettyPrint numArgs}{csStr} ({nCtors} ctors) [{bundle.reprScore indSched.score}]"
                   if showSchedules indSched then
                     let allScheds := indSched.baseSchedules ++ indSched.recSchedules
                     for (ctorName, schedule) in allScheds do
@@ -2294,7 +2318,12 @@ def elabDeriveMutual : CommandElab := fun stx => do
                   lines := lines.push s!"  ● {k.prettyPrint numArgs} (pre-existing)"
                 else
                   let nCtors := indSched.baseSchedules.length + indSched.recSchedules.length
-                  lines := lines.push s!"  ● {specQuality indSched} {k.prettyPrint numArgs} ({nCtors} ctors) [{bundle.reprScore indSched.score}]"
+                  let csStr : String := match constraintMap[k]? with
+                    | some cs => if cs.isEmpty then ""
+                      else let ns : Array String := cs.map Name.getString!
+                           " {" ++ String.intercalate ", " ns.toList ++ "}"
+                    | none => ""
+                  lines := lines.push s!"  ● {specQuality indSched} {k.prettyPrint numArgs}{csStr} ({nCtors} ctors) [{bundle.reprScore indSched.score}]"
                   if showSchedules indSched then
                     let allScheds := indSched.baseSchedules ++ indSched.recSchedules
                     for (ctorName, schedule) in allScheds do
