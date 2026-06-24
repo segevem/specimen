@@ -555,16 +555,16 @@ def getScheduleForInductiveRelationConstructor
           | .lcons fstSchdM rest =>
           let (fstSchd, countSeen) ← fstSchdM
           let inputVarSet := Std.HashSet.ofList fixedVars
-          let scoreSchedule := fun (steps : List ScheduleStep) =>
-            let stepScores := steps.map fun step => bundle.stepScorer key depMemo inputVarSet step
-            bundle.scheduleScorer stepScores
+          let scoreSchedule := fun (steps : List ScheduleStep) => do
+            let stepScores ← steps.mapM fun step => bundle.stepScorer key depMemo inputVarSet step
+            return bundle.scheduleScorer stepScores
           let mut countProcessed := 1
-          let mut bestScore := scoreSchedule fstSchd
+          let mut bestScore ← scoreSchedule fstSchd
           let mut bestSchedule := fstSchd
           trace[plausible.deriving.results] m!"First Schedule: {ppScheduleSteps bestSchedule} \nScore: {bundle.reprScore bestScore}\nSchedules Considered: {repr countSeen}\nSchedules Processed: {repr countProcessed}"
           for schdM in rest.get do
             let (schd, countSeen) ← schdM
-            let score := scoreSchedule schd
+            let score ← scoreSchedule schd
             countProcessed := countProcessed + 1
             if bundle.isBetter score bestScore then
               bestSchedule := schd

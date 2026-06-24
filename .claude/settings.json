@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(lake build *)",
+      "Bash(lake env *)",
+      "Bash(lake test *)",
+      "Bash(timeout *)",
+      "WebFetch",
+      "mcp__lean-lsp__lean_get_widgets",
+      "mcp__lean-lsp__lean_diagnostic_messages",
+      "mcp__lean-lsp__lean_goal",
+      "mcp__lean-lsp__lean_run_code",
+      "mcp__lean-lsp__lean_local_search",
+      "mcp__lean-lsp__lean_loogle",
+      "mcp__lean-lsp__lean_leansearch",
+      "mcp__lean-lsp__lean_leanfinder",
+      "mcp__lean-lsp__lean_multi_attempt",
+      "mcp__lean-lsp__lean_code_actions"
+    ]
+  }
+}
