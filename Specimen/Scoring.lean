@@ -112,6 +112,15 @@ def balancedCtorWeight (scoreBadness : Float) (isRec : Bool) (size : Nat) (_numB
     else max 1 (size / max 1 numRec) * quality
   else quality * 4
 
+/-- Quality-only weight: budget splitting handles termination and size control,
+    so the weight function only differentiates by constructor quality.
+    No structural bias between base/recursive constructors. -/
+def qualityCtorWeight (scoreBadness : Float) (_isRec : Bool) (_size : Nat) (_numBase _numRec : Nat) : Nat :=
+  if scoreBadness < 0.25 then 4
+  else if scoreBadness < 0.5 then 3
+  else if scoreBadness < 0.75 then 2
+  else 1
+
 structure WeightFnEntry where
   name : Name
   fn : CtorWeightFn
@@ -127,9 +136,10 @@ initialize registerWeightFn `Scoring.quickchickCtorWeight quickchickCtorWeight `
 initialize registerWeightFn `Scoring.flatCtorWeight flatCtorWeight ``flatCtorWeight
 initialize registerWeightFn `Scoring.scoreAwareCtorWeight scoreAwareCtorWeight ``scoreAwareCtorWeight
 initialize registerWeightFn `Scoring.balancedCtorWeight balancedCtorWeight ``balancedCtorWeight
+initialize registerWeightFn `Scoring.qualityCtorWeight qualityCtorWeight ``qualityCtorWeight
 
 register_option specimen.weightFn : String := {
-  defValue := "Scoring.balancedCtorWeight"
+  defValue := "Scoring.qualityCtorWeight"
   descr := "The weight function used for constructor frequency in derived generators."
 }
 
