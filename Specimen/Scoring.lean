@@ -58,6 +58,81 @@ def ctorWeight (density checkSpeed passLikelihood varDeps : Nat)
     quality
 
 ----------------------------------------------
+-- Weight function type and registry
+----------------------------------------------
+
+/-- A weight function computes the runtime frequency weight for a constructor.
+    Arguments: (scoreBadness, isRec, size, numBase, numRec).
+    - scoreBadness: per-constructor quality from the active scorer (0.0 = best, 1.0 = worst)
+    - isRec: whether this constructor is recursive
+    - size: current generation size parameter
+    - numBase/numRec: counts of base vs recursive constructors for this inductive -/
+abbrev CtorWeightFn := Float → Bool → Nat → Nat → Nat → Nat
+
+/-- Ignores score; base=1, recursive=numBase*size/numRec. -/
+def defaultCtorWeight (_scoreBadness : Float) (isRec : Bool) (size : Nat) (numBase numRec : Nat) : Nat :=
+  if isRec then
+    if size == 0 then 1
+    else max 1 (numBase * size / max 1 numRec)
+  else 1
+
+/-- QuickChick-style weight: base=1, recursive=size+1. Ignores score. -/
+def quickchickCtorWeight (_scoreBadness : Float) (isRec : Bool) (size : Nat) (_numBase _numRec : Nat) : Nat :=
+  if isRec then size + 1 else 1
+
+/-- Flat weight: every constructor gets weight 1. Ignores everything. -/
+def flatCtorWeight (_scoreBadness : Float) (_isRec : Bool) (_size : Nat) (_numBase _numRec : Nat) : Nat := 1
+
+/-- Score-aware weight: boosts good constructors (low badness) and deprioritizes
+    recursive ones. Quality maps to 1–4, recursive ctors get an additional size-based
+    penalty so base cases are preferred at small sizes. -/
+def scoreAwareCtorWeight (scoreBadness : Float) (isRec : Bool) (size : Nat) (numBase numRec : Nat) : Nat :=
+  -- quality: 4 (best) down to 1 (worst)
+  let quality := if scoreBadness < 0.25 then 4
+    else if scoreBadness < 0.5 then 3
+    else if scoreBadness < 0.75 then 2
+    else 1
+  if isRec then
+    if size == 0 then 1
+    else max 1 (numBase * size / max 1 numRec) * quality
+  else quality
+
+structure WeightFnEntry where
+  name : Name
+  fn : CtorWeightFn
+  leanName : Name
+
+initialize weightFnRegistry : IO.Ref (Array WeightFnEntry) ← IO.mkRef #[]
+
+def registerWeightFn (name : Name) (fn : CtorWeightFn) (leanName : Name) : IO Unit :=
+  weightFnRegistry.modify (·.push { name, fn, leanName })
+
+initialize registerWeightFn `Scoring.defaultCtorWeight defaultCtorWeight ``defaultCtorWeight
+initialize registerWeightFn `Scoring.quickchickCtorWeight quickchickCtorWeight ``quickchickCtorWeight
+initialize registerWeightFn `Scoring.flatCtorWeight flatCtorWeight ``flatCtorWeight
+initialize registerWeightFn `Scoring.scoreAwareCtorWeight scoreAwareCtorWeight ``scoreAwareCtorWeight
+
+register_option specimen.weightFn : String := {
+  defValue := "Scoring.scoreAwareCtorWeight"
+  descr := "The weight function used for constructor frequency in derived generators."
+}
+
+/-- Get the active weight function name from options. -/
+def getActiveWeightFnName [Monad m] [MonadOptions m] : m Name := do
+  let s : String := Lean.Option.get (← getOptions) specimen.weightFn
+  return s.toName
+
+/-- Resolve the active weight function entry. -/
+def getActiveWeightFn : CoreM WeightFnEntry := do
+  let name ← getActiveWeightFnName
+  let entries ← weightFnRegistry.get
+  match entries.find? (·.name == name) with
+  | some entry => return entry
+  | none => match entries[0]? with
+    | some entry => return entry
+    | none => return { name := `Scoring.scoreAwareCtorWeight, fn := scoreAwareCtorWeight, leanName := ``scoreAwareCtorWeight }
+
+----------------------------------------------
 -- Core typeclass
 ----------------------------------------------
 
