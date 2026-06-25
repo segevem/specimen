@@ -41,6 +41,64 @@ namespace Scoring
 open Lean Meta Schedules
 
 ----------------------------------------------
+-- Weight function type and registry
+----------------------------------------------
+
+/-- A weight function computes the runtime frequency weight for a constructor.
+    Arguments: (isRec, size, numBase, numRec).
+    - isRec: whether this constructor is recursive
+    - size: current generation size parameter
+    - numBase/numRec: counts of base vs recursive constructors for this inductive -/
+abbrev CtorWeightFn := Bool → Nat → Nat → Nat → Nat
+
+def defaultCtorWeight (isRec : Bool) (size : Nat) (numBase numRec : Nat) : Nat :=
+  if isRec then
+    if size == 0 then 1
+    else max 1 (numBase * size / max 1 numRec)
+  else 1
+
+/-- QuickChick-style weight: base=1, recursive=size+1. -/
+def quickchickCtorWeight (isRec : Bool) (size : Nat) (_numBase _numRec : Nat) : Nat :=
+  if isRec then size + 1 else 1
+
+/-- Flat weight: every constructor gets weight 1 regardless of recursion/size. -/
+def flatCtorWeight (_isRec : Bool) (_size : Nat) (_numBase _numRec : Nat) : Nat := 1
+
+structure WeightFnEntry where
+  name : Name
+  fn : CtorWeightFn
+  leanName : Name
+
+initialize weightFnRegistry : IO.Ref (Array WeightFnEntry) ← IO.mkRef #[]
+
+def registerWeightFn (name : Name) (fn : CtorWeightFn) (leanName : Name) : IO Unit :=
+  weightFnRegistry.modify (·.push { name, fn, leanName })
+
+initialize registerWeightFn `Scoring.defaultCtorWeight defaultCtorWeight ``defaultCtorWeight
+initialize registerWeightFn `Scoring.quickchickCtorWeight quickchickCtorWeight ``quickchickCtorWeight
+initialize registerWeightFn `Scoring.flatCtorWeight flatCtorWeight ``flatCtorWeight
+
+register_option specimen.weightFn : String := {
+  defValue := "Scoring.defaultCtorWeight"
+  descr := "The weight function used for constructor frequency in derived generators."
+}
+
+/-- Get the active weight function name from options. -/
+def getActiveWeightFnName [Monad m] [MonadOptions m] : m Name := do
+  let s : String := Lean.Option.get (← getOptions) specimen.weightFn
+  return s.toName
+
+/-- Resolve the active weight function entry. -/
+def getActiveWeightFn : CoreM WeightFnEntry := do
+  let name ← getActiveWeightFnName
+  let entries ← weightFnRegistry.get
+  match entries.find? (·.name == name) with
+  | some entry => return entry
+  | none => match entries[0]? with
+    | some entry => return entry
+    | none => return { name := `Scoring.defaultCtorWeight, fn := defaultCtorWeight, leanName := ``defaultCtorWeight }
+
+----------------------------------------------
 -- Core typeclass
 ----------------------------------------------
 
