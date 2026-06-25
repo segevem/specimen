@@ -768,7 +768,7 @@ def deriveConstrainedProducer
             let subProducerTerm ←
               match producerSort with
               | .Generator =>
-                `( ($weightFnIdent true $freshSize' $numBaseLit $numRecLit, $subProducer) )
+                `( ($weightFnIdent 0.0 true $freshSize' $numBaseLit $numRecLit, $subProducer) )
               | .Enumerator => pure subProducer
             recursiveProducers := recursiveProducers.push subProducerTerm
           else
@@ -777,7 +777,7 @@ def deriveConstrainedProducer
             let subGeneratorTerm ←
               match producerSort with
               | .Generator =>
-                `( ($weightFnIdent false 0 $numBaseLit $numRecLit, $subProducer) )
+                `( ($weightFnIdent 0.0 false 0 $numBaseLit $numRecLit, $subProducer) )
               | .Enumerator => pure subProducer
             nonRecursiveProducers := nonRecursiveProducers.push subGeneratorTerm
 
@@ -856,13 +856,18 @@ def compileInductiveSchedule (indSched : InductiveSchedule)
         | other => other
     let weightEntry ← Scoring.getActiveWeightFn
     let weightFnIdent := mkIdent weightEntry.leanName
+    let bundle ← Scoring.getActiveScorerBundle
+    let lookupCtorBadness (ctorName : Name) : Float :=
+      match indSched.ctorStats.find? (fun (n, _, _, _) => n == ctorName) with
+      | some (_, _, _, s) => bundle.scoreBadness s
+      | none => 0.0
     let numBaseMutual := indSched.baseSchedules.filter (fun (_, (steps, _)) =>
       scheduleUsesMutualCall (rewriteSchedule steps))
     let numBase := indSched.baseSchedules.length - numBaseMutual.length
     let numRec := indSched.recSchedules.length + numBaseMutual.length
     let numBaseLit := Syntax.mkNumLit (toString numBase)
     let numRecLit := Syntax.mkNumLit (toString numRec)
-    for (_, schedule) in indSched.baseSchedules do
+    for (ctorName, schedule) in indSched.baseSchedules do
       let (steps, sort) := schedule
       let rewrittenSteps := rewriteSchedule steps
       let rewrittenSchedule := (rewrittenSteps, sort)
@@ -870,30 +875,32 @@ def compileInductiveSchedule (indSched : InductiveSchedule)
         let mexp ← MExp.scheduleToMExp rewrittenSchedule (.MId `size) (.MId `initSize) outputType
           (fuelPrimeName := freshFuelPrimeName) (sizePrimeName := freshSizePrimeName)
         MExp.mexpToTSyntax mexp key.deriveSort)
+      let badnessLit := Syntax.mkScientificLit (toString (lookupCtorBadness ctorName))
       if scheduleUsesMutualCall rewrittenSteps then
         let term ← match key.deriveSort with
           | .Generator =>
-            `( ($weightFnIdent true $freshSize' $numBaseLit $numRecLit, $subProducer) )
+            `( ($weightFnIdent $badnessLit true $freshSize' $numBaseLit $numRecLit, $subProducer) )
           | .Enumerator => pure subProducer
           | .Checker | .Theorem => `(fun (_ : Unit) => $subProducer)
         recursiveProducers := recursiveProducers.push term
       else
         let term ← match key.deriveSort with
           | .Generator =>
-            `( ($weightFnIdent false 0 $numBaseLit $numRecLit, $subProducer) )
+            `( ($weightFnIdent $badnessLit false 0 $numBaseLit $numRecLit, $subProducer) )
           | .Enumerator => pure subProducer
           | .Checker | .Theorem => `(fun (_ : Unit) => $subProducer)
         nonRecursiveProducers := nonRecursiveProducers.push term
-    for (_, schedule) in indSched.recSchedules do
+    for (ctorName, schedule) in indSched.recSchedules do
       let (steps, sort) := schedule
       let rewrittenSchedule := (rewriteSchedule steps, sort)
       let (subProducer, _) ← StateT.run (s := #[]) (do
         let mexp ← MExp.scheduleToMExp rewrittenSchedule (.MId `size) (.MId `initSize) outputType
           (fuelPrimeName := freshFuelPrimeName) (sizePrimeName := freshSizePrimeName)
         MExp.mexpToTSyntax mexp key.deriveSort)
+      let badnessLit := Syntax.mkScientificLit (toString (lookupCtorBadness ctorName))
       let term ← match key.deriveSort with
         | .Generator =>
-          `( ($weightFnIdent true $freshSize' $numBaseLit $numRecLit, $subProducer) )
+          `( ($weightFnIdent $badnessLit true $freshSize' $numBaseLit $numRecLit, $subProducer) )
         | .Enumerator => pure subProducer
         | .Checker | .Theorem => `(fun (_ : Unit) => $subProducer)
       recursiveProducers := recursiveProducers.push term
@@ -1335,13 +1342,13 @@ def deriveConstrainedProducerParts
           if isRecursive then
             let subProducerTerm ← match producerSort with
               | .Generator =>
-                `( ($weightFnIdent true $freshSize' $numBaseLit $numRecLit, $subProducer) )
+                `( ($weightFnIdent 0.0 true $freshSize' $numBaseLit $numRecLit, $subProducer) )
               | .Enumerator => pure subProducer
             recursiveProducers := recursiveProducers.push subProducerTerm
           else
             let subGeneratorTerm ← match producerSort with
               | .Generator =>
-                `( ($weightFnIdent false 0 $numBaseLit $numRecLit, $subProducer) )
+                `( ($weightFnIdent 0.0 false 0 $numBaseLit $numRecLit, $subProducer) )
               | .Enumerator => pure subProducer
             nonRecursiveProducers := nonRecursiveProducers.push subGeneratorTerm
         | none => throwError m!"Unable to derive producer schedule for constructor {ctorName}"
