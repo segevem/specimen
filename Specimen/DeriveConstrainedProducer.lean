@@ -753,7 +753,7 @@ def deriveConstrainedProducer
           -- This is all done in a state monad: when we detect that a new instance is required, we append it to an array of `TSyntax term`s
           -- (where each term represents a typeclass instance)
           let (subProducer, instances) ← StateT.run (s := #[]) (do
-            let mexp ← MExp.scheduleToMExp schedule (.MId `size) (.MId `initSize) outputType (fuelPrimeName := freshFuelPrimeName) (sizePrimeName := freshSizePrimeName)
+            let mexp ← MExp.scheduleToMExp schedule (.MId `size) (.MId `initSize) outputType (fuelPrimeName := freshFuelPrimeName) (sizePrimeName := freshSizePrimeName) (targetInductive := inductiveName)
             MExp.mexpToTSyntax mexp deriveSort)
 
           requiredInstances := requiredInstances ++ instances
@@ -1151,7 +1151,7 @@ def compileInductiveSchedule (indSched : InductiveSchedule)
       let rewrittenSchedule := (rewrittenSteps, sort)
       let (subProducer, _) ← StateT.run (s := #[]) (do
         let mexp ← MExp.scheduleToMExp rewrittenSchedule (.MId `size) (.MId `initSize) outputType
-          (fuelPrimeName := freshFuelPrimeName) (sizePrimeName := freshSizePrimeName)
+          (fuelPrimeName := freshFuelPrimeName) (sizePrimeName := freshSizePrimeName) (targetInductive := key.inductiveName)
         MExp.mexpToTSyntax mexp key.deriveSort)
       let badnessLit := Syntax.mkScientificLit (toString (lookupCtorBadness ctorName))
       if scheduleUsesMutualCall rewrittenSteps then
@@ -1173,7 +1173,7 @@ def compileInductiveSchedule (indSched : InductiveSchedule)
       let rewrittenSchedule := (rewriteSchedule steps, sort)
       let (subProducer, _) ← StateT.run (s := #[]) (do
         let mexp ← MExp.scheduleToMExp rewrittenSchedule (.MId `size) (.MId `initSize) outputType
-          (fuelPrimeName := freshFuelPrimeName) (sizePrimeName := freshSizePrimeName)
+          (fuelPrimeName := freshFuelPrimeName) (sizePrimeName := freshSizePrimeName) (targetInductive := key.inductiveName)
         MExp.mexpToTSyntax mexp key.deriveSort)
       let badnessLit := Syntax.mkScientificLit (toString (lookupCtorBadness ctorName))
       let term ← match key.deriveSort with
@@ -1612,7 +1612,7 @@ def deriveConstrainedProducerParts
           let rewrittenSteps := scheduleRewriter scheduleSteps
           let schedule := (rewrittenSteps, scheduleSort)
           let (subProducer, requiredInsts) ← StateT.run (s := #[]) (do
-            let mexp ← MExp.scheduleToMExp schedule (.MId `size) (.MId `initSize) _outputType (fuelPrimeName := freshFuelPrimeName) (sizePrimeName := freshSizePrimeName)
+            let mexp ← MExp.scheduleToMExp schedule (.MId `size) (.MId `initSize) _outputType (fuelPrimeName := freshFuelPrimeName) (sizePrimeName := freshSizePrimeName) (targetInductive := inductiveName)
             MExp.mexpToTSyntax mexp deriveSort)
           if !requiredInsts.isEmpty then
             let outputIdxsStr := outputNamesTypesIndices.map (fun (n, _, i) => s!"{n}@{i}")
