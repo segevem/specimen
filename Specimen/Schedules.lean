@@ -624,4 +624,17 @@ def scheduleUsesMutualCall (steps : List ScheduleStep) : Bool :=
     | .Check (.MutRec ..) _ => true
     | _ => false
 
+/-- Count how many recursive calls (self or mutual) appear in a schedule's steps.
+    Used for Haskell-style budget splitting: each call gets size/numRecCalls. -/
+def countRecCalls (steps : List ScheduleStep) : Nat :=
+  steps.foldl (fun acc step =>
+    match step with
+    | .Unconstrained _ (.Rec ..) _ => acc + 1
+    | .Unconstrained _ (.MutRec ..) _ => acc + 1
+    | .SuchThat _ (.Rec ..) _ => acc + 1
+    | .SuchThat _ (.MutRec ..) _ => acc + 1
+    | .Check (.Rec ..) _ => acc + 1
+    | .Check (.MutRec ..) _ => acc + 1
+    | _ => acc) 0
+
 end Schedules
