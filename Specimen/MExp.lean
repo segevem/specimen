@@ -192,10 +192,10 @@ partial def mexpToConstructorExpr (m : MExp) : Option ConstructorExpr :=
 
 /-- `MExp` representation of a recursive function call,
     where `f` is the function name, `fuelPrimeName` is the name for `fuel'`,
-    `sizePrimeName` is for `size'`, and `args` are the input arguments -/
-def recCall (f : Name) (fuelPrimeName : Name) (sizePrimeName : Name) (args : List ConstructorExpr) : MExp :=
+    `sizeExpr` is the size budget passed to the recursive call, and `args` are the input arguments -/
+def recCall (f : Name) (fuelPrimeName : Name) (sizeExpr : MExp) (args : List ConstructorExpr) : MExp :=
   .MApp .allowImplicit (.MId f) $
-    [.MId fuelPrimeName, .MId `initSize, .MId sizePrimeName] ++ (constructorExprToMExp .allExplicit <$> args)
+    [.MId fuelPrimeName, .MId `initSize, sizeExpr] ++ (constructorExprToMExp .allExplicit <$> args)
 
 /-- Converts a `HypothesisExpr` to an `MExp` -/
 def hypothesisExprToMExp (hypExpr : HypothesisExpr) : MExp :=
@@ -415,7 +415,7 @@ private def nameAndConstructorExprToTypedVar (v : Name × Option ConstructorExpr
       supplied to the generator/enumerator/checker we're deriving
 -/
 
-def scheduleStepToMExp (step : ScheduleStep) (defFuel : MExp) (k : MExp) (outputType : Expr) (fuelPrimeName : Name) (sizePrimeName : Name) : CompileScheduleM MExp :=
+def scheduleStepToMExp (step : ScheduleStep) (defFuel : MExp) (k : MExp) (outputType : Expr) (fuelPrimeName : Name) (sizeExpr : MExp) : CompileScheduleM MExp :=
   match step with
   | .Unconstrained v src prodSort => do
     let monadSort := prodSortToMonadSort prodSort
@@ -426,7 +426,7 @@ def scheduleStepToMExp (step : ScheduleStep) (defFuel : MExp) (k : MExp) (output
       let producer ← unconstrainedProducer prodSort ty
       pure $ .MBind monadSort producer [⟨v,tyExpr⟩] k
     | Source.Rec f args | Source.MutRec f args =>
-      pure $ .MBind monadSort (recCall f fuelPrimeName sizePrimeName args) [⟨v, outputType⟩] k
+      pure $ .MBind monadSort (recCall f fuelPrimeName sizeExpr args) [⟨v, outputType⟩] k
 
   | .SuchThat varsTys prod ps => do
     let monadSort := prodSortToOptionTMonadSort ps
@@ -436,7 +436,7 @@ def scheduleStepToMExp (step : ScheduleStep) (defFuel : MExp) (k : MExp) (output
       let producer ← constrainedProducer ps varsTys (hypothesisExprToMExp hypExpr) defFuel
       pure $ .MBind monadSort producer typedVars k
     | Source.Rec f args | Source.MutRec f args =>
-      pure $ .MBind monadSort (recCall f fuelPrimeName sizePrimeName args) typedVars k
+      pure $ .MBind monadSort (recCall f fuelPrimeName sizeExpr args) typedVars k
   | .Check src polarity =>
 
     let checker :=
@@ -444,7 +444,7 @@ def scheduleStepToMExp (step : ScheduleStep) (defFuel : MExp) (k : MExp) (output
       | Source.NonRec hypExpr =>
         decOptChecker (hypothesisExprToMExp hypExpr) defFuel
       | Source.Rec f args | Source.MutRec f args =>
-        recCall f fuelPrimeName sizePrimeName args
+        recCall f fuelPrimeName sizeExpr args
 
     let checker :=
       if polarity then checker
@@ -461,6 +461,11 @@ def scheduleStepToMExp (step : ScheduleStep) (defFuel : MExp) (k : MExp) (output
       in the QuickChick code for the derived functions) -/
 def scheduleToMExp (schedule : Schedule) (mfuel : MExp) (defFuel : MExp) (recType : Expr) (fuelPrimeName : Name := `fuel') (sizePrimeName : Name := `size') : CompileScheduleM MExp :=
   let (scheduleSteps, scheduleSort) := schedule
+  -- Compute the size expression for recursive calls: split budget across rec calls
+  let numRecCalls := Schedules.countRecCalls scheduleSteps
+  let sizeExpr : MExp :=
+    if numRecCalls ≤ 1 then .MId sizePrimeName
+    else .MApp .allExplicit (.MConst ``Nat.div) [.MId sizePrimeName, .MLit (.natVal numRecCalls)]
   -- Determine the *epilogue* of the schedule (i.e. what happens after we
   -- have finished executing all the `scheduleStep`s)
   let epilogue :=
@@ -485,5 +490,5 @@ def scheduleToMExp (schedule : Schedule) (mfuel : MExp) (defFuel : MExp) (recTyp
   -- Fold over the `scheduleSteps` and convert each of them to a functional `MExp`
   -- Note that the fold composes the `MExp`, and we use `foldr` since
   -- we want the `epilogue` to be the base-case of the fold
-  List.foldrM (fun step acc => scheduleStepToMExp step defFuel acc recType fuelPrimeName sizePrimeName)
+  List.foldrM (fun step acc => scheduleStepToMExp step defFuel acc recType fuelPrimeName sizeExpr)
     epilogue scheduleSteps
