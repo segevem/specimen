@@ -97,6 +97,21 @@ def scoreAwareCtorWeight (scoreBadness : Float) (isRec : Bool) (size : Nat) (num
     else max 1 (numBase * size / max 1 numRec) * quality
   else quality
 
+/-- Balanced weight for inductives with many recursive constructors.
+    Controls aggregate P(recursive) ≈ size / (size + 4*numBase) by distributing
+    size across all recursive ctors (so total rec weight ≈ size * quality).
+    Base ctors get a 4x boost so they stay relevant even with many rec branches.
+    Quality differentiates within each group. -/
+def balancedCtorWeight (scoreBadness : Float) (isRec : Bool) (size : Nat) (_numBase numRec : Nat) : Nat :=
+  let quality := if scoreBadness < 0.25 then 4
+    else if scoreBadness < 0.5 then 3
+    else if scoreBadness < 0.75 then 2
+    else 1
+  if isRec then
+    if size == 0 then 0
+    else max 1 (size / max 1 numRec) * quality
+  else quality * 4
+
 structure WeightFnEntry where
   name : Name
   fn : CtorWeightFn
@@ -111,9 +126,10 @@ initialize registerWeightFn `Scoring.defaultCtorWeight defaultCtorWeight ``defau
 initialize registerWeightFn `Scoring.quickchickCtorWeight quickchickCtorWeight ``quickchickCtorWeight
 initialize registerWeightFn `Scoring.flatCtorWeight flatCtorWeight ``flatCtorWeight
 initialize registerWeightFn `Scoring.scoreAwareCtorWeight scoreAwareCtorWeight ``scoreAwareCtorWeight
+initialize registerWeightFn `Scoring.balancedCtorWeight balancedCtorWeight ``balancedCtorWeight
 
 register_option specimen.weightFn : String := {
-  defValue := "Scoring.scoreAwareCtorWeight"
+  defValue := "Scoring.balancedCtorWeight"
   descr := "The weight function used for constructor frequency in derived generators."
 }
 
