@@ -139,7 +139,7 @@ initialize registerWeightFn `Scoring.balancedCtorWeight balancedCtorWeight ``bal
 initialize registerWeightFn `Scoring.qualityCtorWeight qualityCtorWeight ``qualityCtorWeight
 
 register_option specimen.weightFn : String := {
-  defValue := "Scoring.qualityCtorWeight"
+  defValue := "Scoring.balancedCtorWeight"
   descr := "The weight function used for constructor frequency in derived generators."
 }
 
