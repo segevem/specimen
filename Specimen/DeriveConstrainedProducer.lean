@@ -1032,8 +1032,12 @@ def computeStructLeafBinders (allSteps : List ScheduleStep)
   let mut allLeaves : Array (TSyntax `term) := #[]
   for (paramName, paramType) in structParams do
     allLeaves := allLeaves ++ (← discoverStructLeaves paramName paramType)
-  -- Walk all schedule steps and collect which leaves are needed
+  -- Always emit DecidableEq for all leaves (needed for pattern matching and
+  -- equality checks in generated code — matches old expandStructInstBinders behavior)
   let mut needed : Array (Name × TSyntax `term) := #[]
+  for leaf in allLeaves do
+    needed := needed.push (``DecidableEq, leaf)
+  -- Walk schedule steps to discover which leaves need Arbitrary/Enum
   for step in allSteps do
     match step with
     | .Unconstrained _ (.NonRec (indName, args)) ps =>
@@ -1095,6 +1099,30 @@ def computeStructLeafBinders (allSteps : List ScheduleStep)
               let entry := (tcName, leaf)
               unless needed.any (fun p => p.1 == entry.1 && p.2.raw == entry.2.raw) do
                 needed := needed.push entry
+    | .Check (.NonRec (indName, _args)) _ =>
+      -- Check steps may compare values whose TYPE is a struct-param leaf (e.g.
+      -- comparing two Metadata values). The args often contain fvars bound by
+      -- earlier Unconstrained steps, not direct projection chains. Conservatively
+      -- emit DecidableEq for all leaves when any Check step exists.
+      if indName == ``Eq || indName == ``Ne then
+        for leaf in allLeaves do
+          let entry := (``DecidableEq, leaf)
+          unless needed.any (fun p => p.1 == entry.1 && p.2.raw == entry.2.raw) do
+            needed := needed.push entry
+    | .SuchThat _ (.NonRec (_indName, args)) ps =>
+      let chains ← args.foldlM (fun acc arg =>
+        (· ++ acc) <$> collectStructProjChains structParamNames arg) []
+      if !chains.isEmpty then
+        -- The constrained producer dep needs the producer class on its type params.
+        -- Bubble up the same class for struct-param leaves, matching what
+        -- computeSpecConstraints does for plain type vars.
+        let tcName := match ps with
+          | .Generator => ``Plausible.Arbitrary
+          | .Enumerator => ``Enum
+        for leaf in allLeaves do
+          let entry := (tcName, leaf)
+          unless needed.any (fun p => p.1 == entry.1 && p.2.raw == entry.2.raw) do
+            needed := needed.push entry
     | _ => pure ()
   return needed
 
@@ -1228,31 +1256,31 @@ private partial def synthExternalConstraints (indName : Name) (args : List Const
     constraints for sibling specs in the same SCC. Pass `none` for non-mutual specs. -/
 def computeSpecConstraints (indSched : InductiveSchedule)
     (typeParamNames : Array Name) (ownDeriveSort : DeriveSort)
-    (depConstraintMap : Std.HashMap SpecKey (Array Name))
-    (siblingConstraints : Option (Std.HashMap SpecKey (Array Name)) := none)
-    : TermElabM (Array Name) := do
+    (depConstraintMap : Std.HashMap SpecKey (Array (Name × Name)))
+    (siblingConstraints : Option (Std.HashMap SpecKey (Array (Name × Name))) := none)
+    : TermElabM (Array (Name × Name)) := do
   if typeParamNames.isEmpty then return #[]
   let typeParamSet := Std.HashSet.ofArray typeParamNames
-  let mut constraints : Std.HashSet Name := {}
+  let mut constraints : Std.HashSet (Name × Name) := {}
   let allScheds := indSched.baseSchedules ++ indSched.recSchedules
   let allSteps := allScheds.flatMap (fun (_, (steps, _)) => steps)
+  let insertForRefs := fun (cs : Std.HashSet (Name × Name)) (classes : Array Name) (refs : Std.HashSet Name) =>
+    classes.foldl (fun acc cls =>
+      refs.toList.foldl (fun acc' p => acc'.insert (cls, p)) acc) cs
   for step in allSteps do
     match step with
     | .Unconstrained _ (.NonRec (indName, args)) ps =>
       let tcName := match ps with
         | .Generator => ``Plausible.Arbitrary
         | .Enumerator => ``Enum
-      -- Check if any type param is referenced (directly or nested)
       let refs := args.foldl (fun acc a => acc.union (extractTypeParamRefs typeParamSet a)) ({} : Std.HashSet Name)
       if indName == tcName then
-        pure ()  -- shouldn't happen, but guard
+        pure ()
       else if typeParamNames.contains indName then
-        -- Bare type param: add own-sort class directly
-        constraints := constraints.insert tcName
+        constraints := constraints.insert (tcName, indName)
       else if !refs.isEmpty then
-        -- Compound type containing type params: synthesis to discover requirements
         let found ← synthExternalConstraints indName args typeParamNames tcName
-        for c in found do constraints := constraints.insert c
+        constraints := insertForRefs constraints found refs
     | .Unconstrained _ (.Rec ..) _ => pure ()
     | .Unconstrained _ (.MutRec sibName _) _ =>
       if let some sibs := siblingConstraints then
@@ -1262,27 +1290,26 @@ def computeSpecConstraints (indSched : InductiveSchedule)
     | .Check (.NonRec (indName, args)) _ =>
       let refs := args.foldl (fun acc a => acc.union (extractTypeParamRefs typeParamSet a)) ({} : Std.HashSet Name)
       if !refs.isEmpty then
-        -- Eq/Ne checks require DecidableEq on the type param
         if indName == ``Eq || indName == ``Ne then
-          constraints := constraints.insert ``DecidableEq
+          constraints := insertForRefs constraints #[``DecidableEq] refs
         else
-          -- Look up dep constraints from our map first (internal dep)
           let depKey : SpecKey := { inductiveName := indName, outputIndices := [], deriveSort := .Checker }
           match depConstraintMap[depKey]? with
-          | some depCs => for c in depCs do constraints := constraints.insert c
+          | some depCs =>
+            let classes := depCs.map Prod.fst |>.toList.eraseDups.toArray
+            constraints := insertForRefs constraints classes refs
           | none =>
-            -- Check sibling constraints (mutual block)
             let fromSibling := siblingConstraints.bind (·[depKey]?)
             match fromSibling with
-            | some depCs => for c in depCs do constraints := constraints.insert c
+            | some depCs =>
+              let classes := depCs.map Prod.fst |>.toList.eraseDups.toArray
+              constraints := insertForRefs constraints classes refs
             | none =>
-              -- External dep: use synthesis
               let found ← synthExternalConstraints indName args typeParamNames ``DecOpt
               if found.isEmpty then
-                -- Synthesis failed; fall back to checker defaults
-                constraints := constraints.insert ``Enum |>.insert ``DecidableEq
+                constraints := insertForRefs constraints #[``Enum, ``DecidableEq] refs
               else
-                for c in found do constraints := constraints.insert c
+                constraints := insertForRefs constraints found refs
     | .Check (.Rec ..) _ => pure ()
     | .Check (.MutRec sibName _) _ =>
       if let some sibs := siblingConstraints then
@@ -1297,18 +1324,22 @@ def computeSpecConstraints (indSched : InductiveSchedule)
           ((match step with | .SuchThat vs _ _ => vs.map Prod.fst | _ => []))
         let depKey : SpecKey := { inductiveName := indName, outputIndices := outputIndices, deriveSort := ds }
         match depConstraintMap[depKey]? with
-        | some depCs => for c in depCs do constraints := constraints.insert c
+        | some depCs =>
+          let classes := depCs.map Prod.fst |>.toList.eraseDups.toArray
+          constraints := insertForRefs constraints classes refs
         | none =>
           let fromSibling := siblingConstraints.bind (·[depKey]?)
           match fromSibling with
-          | some depCs => for c in depCs do constraints := constraints.insert c
+          | some depCs =>
+            let classes := depCs.map Prod.fst |>.toList.eraseDups.toArray
+            constraints := insertForRefs constraints classes refs
           | none =>
             let tcName := match ps with
               | .Generator => ``ArbitrarySizedSuchThat
               | .Enumerator => ``EnumSizedSuchThat
             let outNames := match step with | .SuchThat vs _ _ => vs.map Prod.fst | _ => []
             let found ← synthExternalConstraints indName args typeParamNames tcName outNames
-            for c in found do constraints := constraints.insert c
+            constraints := insertForRefs constraints found refs
     | .SuchThat _ (.Rec ..) _ => pure ()
     | .SuchThat _ (.MutRec sibName _) _ =>
       if let some sibs := siblingConstraints then
@@ -1323,11 +1354,10 @@ def computeSpecConstraints (indSched : InductiveSchedule)
     all its non-mutual deps already have their constraints computed.
     For mutual blocks, uses fixed-point iteration until stable. -/
 def propagateConstraints (components : List (List SpecKey))
-    (memo : Std.HashMap SpecKey MemoEntry) : TermElabM (Std.HashMap SpecKey (Array Name)) := do
-  let mut result : Std.HashMap SpecKey (Array Name) := {}
+    (memo : Std.HashMap SpecKey MemoEntry) : TermElabM (Std.HashMap SpecKey (Array (Name × Name))) := do
+  let mut result : Std.HashMap SpecKey (Array (Name × Name)) := {}
   for comp in components do
     if comp.length == 1 then
-      -- Single-spec component: compute directly using already-computed dep constraints
       let key := comp.head!
       match memo[key]? with
       | some (.done indSched) =>
@@ -1346,8 +1376,7 @@ def propagateConstraints (components : List (List SpecKey))
           result := result.insert key cs
       | _ => result := result.insert key #[]
     else
-      -- Mutual block: fixed-point iteration
-      let mut sibMap : Std.HashMap SpecKey (Array Name) := {}
+      let mut sibMap : Std.HashMap SpecKey (Array (Name × Name)) := {}
       for key in comp do sibMap := sibMap.insert key #[]
       let mut changed := true
       while changed do
@@ -1369,7 +1398,6 @@ def propagateConstraints (components : List (List SpecKey))
               changed := true
               sibMap := sibMap.insert key cs
           | _ => pure ()
-      -- Copy converged sibling constraints into result
       for (key, cs) in sibMap.toList do
         result := result.insert key cs
   return result
@@ -1379,7 +1407,7 @@ def propagateConstraints (components : List (List SpecKey))
     `siblings` is the list of specs in the same mutual block (for rewriting to Source.MutRec). -/
 def compileInductiveSchedule (indSched : InductiveSchedule)
     (globalName : Name) (siblings : List (Name × List Nat × Name × DeriveSort))
-    (requiredConstraints : Option (Array Name) := none)
+    (requiredConstraints : Option (Array (Name × Name)) := none)
     : TermElabM (TSyntax `command × TSyntax `command) := do
   let key := indSched.key
   let indInfo ← getConstInfoInduct key.inductiveName
@@ -2232,7 +2260,10 @@ def elabDeriveMutual : CommandElab := fun stx => do
         let constraintMap ← liftTermElabM <| propagateConstraints components finalMemo
         -- Compute type param indices per spec and detect instance-param constraints (for display)
         let mut typeParamIdxMap : Std.HashMap SpecKey (Array Nat) := {}
-        let mut displayConstraintMap := constraintMap
+        -- For display, flatten constraint pairs to class names
+        let mut displayConstraintMap : Std.HashMap SpecKey (Array Name) := {}
+        for (key, pairs) in constraintMap.toList do
+          displayConstraintMap := displayConstraintMap.insert key (pairs.map Prod.fst |>.toList.eraseDups.toArray)
         for (key, _) in constraintMap.toList do
           let (idxs, extraCs) ← liftTermElabM do
             try
@@ -2246,7 +2277,6 @@ def elabDeriveMutual : CommandElab := fun stx => do
                 if ty.isSort then
                   sortIdxs := sortIdxs.push i
                 else
-                  -- Check if this param's type is a typeclass applied to a type param
                   let fn := ty.getAppFn
                   if fn.isConst then
                     if let some tcName := fn.constName? then
@@ -2263,7 +2293,7 @@ def elabDeriveMutual : CommandElab := fun stx => do
         -- Warn about required constraints that Specimen cannot provide
         let providedConstraints : Std.HashSet Name := Std.HashSet.ofList
           [``Plausible.Arbitrary, ``Enum, ``DecidableEq]
-        for (key, cs) in constraintMap.toList do
+        for (key, cs) in displayConstraintMap.toList do
           if cs.isEmpty then continue
           let numArgs ← liftTermElabM do
             try pure ((← getComponentsOfArrowType (← getConstInfoInduct key.inductiveName).type).size - 1)
