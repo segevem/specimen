@@ -1537,34 +1537,32 @@ instance : Scorable RecAwareGradedScore where
       let severity := max speedVal likelVal * 0.7 + min speedVal likelVal * 0.3
       min 1.0 (0.75 + severity * 0.25 + recPenalty + varDepPenalty)
 
-private def classifyRecursionKind (memo : Std.HashMap SpecKey MemoEntry) (key : SpecKey)
+private def classifyRecursionKind (key : SpecKey)
     (src : Source) (outputs : List (Name × Option ConstructorExpr)) (prodSort : ProducerSort) : RecursionKind :=
   match src with
   | .Rec .. => .Direct
   | .MutRec .. => .Mutual
   | .NonRec (indName, args) =>
-    let outputIdxs := outputs.filterMap fun (n, _) =>
-      args.findIdx? fun a => match a with | .Unknown v => v == n | _ => false
-    let depDeriveSort := match prodSort with
-      | .Enumerator => DeriveSort.Enumerator
-      | .Generator => DeriveSort.Generator
-    let depKey : SpecKey := { inductiveName := indName, outputIndices := outputIdxs, deriveSort := depDeriveSort }
-    if depKey == key then .Direct
-    else match memo[depKey]? with
-      | some .inProgress => .Mutual
-      | _ => .None
+    if indName != key.inductiveName then .None
+    else
+      let outputIdxs := outputs.filterMap fun (n, _) =>
+        args.findIdx? fun a => match a with | .Unknown v => v == n | _ => false
+      let depDeriveSort := match prodSort with
+        | .Enumerator => DeriveSort.Enumerator
+        | .Generator => DeriveSort.Generator
+      let depKey : SpecKey := { inductiveName := indName, outputIndices := outputIdxs, deriveSort := depDeriveSort }
+      if depKey == key then .Direct
+      else .Mutual
 
-private def classifyRecursionKindCheck (memo : Std.HashMap SpecKey MemoEntry) (key : SpecKey)
-    (src : Source) : RecursionKind :=
+private def classifyRecursionKindCheck (key : SpecKey) (src : Source) : RecursionKind :=
   match src with
   | .Rec .. => .Direct
   | .MutRec .. => .Mutual
   | .NonRec (indName, _args) =>
-    let depKey : SpecKey := { inductiveName := indName, outputIndices := [], deriveSort := .Checker }
-    if depKey == key then .Direct
-    else match memo[depKey]? with
-      | some .inProgress => .Mutual
-      | _ => .None
+    if indName != key.inductiveName then .None
+    else
+      if key.deriveSort == .Checker && key.outputIndices.isEmpty then .Direct
+      else .Mutual
 
 def recAwareStepScorer : StepScorer RecAwareGradedScore := fun key memo inputVars step => do
   match step with
@@ -1574,12 +1572,12 @@ def recAwareStepScorer : StepScorer RecAwareGradedScore := fun key memo inputVar
     let varDeps := countGeneratedVarDeps inputVars src
     let speed := classifyCheckSpeed memo key src varDeps
     let likelihood ← classifyPassLikelihood inputVars key src polarity varDeps
-    let recKind := classifyRecursionKindCheck memo key src
+    let recKind := classifyRecursionKindCheck key src
     return { density := .Checking, recursionKind := recKind, checkSpeed := speed, passLikelihood := likelihood, varDeps := varDeps }
   | .SuchThat outputs src prodSort =>
     let outputNames := Std.HashSet.ofList (outputs.map (·.1))
     let varDeps := countGeneratedVarDeps (inputVars.union outputNames) src
-    let recKind := classifyRecursionKind memo key src outputs prodSort
+    let recKind := classifyRecursionKind key src outputs prodSort
     let depDensity : Density := match src with
       | .Rec .. => .Partial
       | .MutRec .. => .Partial
