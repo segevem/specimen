@@ -51,6 +51,16 @@ register_option specimen.searchLimit : Nat := {
   descr := "max hypothesis orderings to evaluate per constructor during schedule search"
 }
 
+/-- When true, constructor weight expressions are partially evaluated at elaboration time:
+    the weight function is reduced under the runtime `size` binder so the generated code
+    contains a small residual expression in `size` instead of a full weight-function call.
+    Requires the weight/modifier arguments to be kernel-reducible (they are — badness is a
+    per-mille `Nat`, not a `Float`). Falls back to the un-reduced call on any failure. -/
+register_option specimen.precomputeWeights : Bool := {
+  defValue := false
+  descr := "partially evaluate constructor weight functions under the size binder at elaboration time"
+}
+
 /-- Whether the `specimen`/`specimen_test` shrinker attempts to minimize counterexamples. -/
 register_option specimen.shrink : Bool := {
   defValue := true

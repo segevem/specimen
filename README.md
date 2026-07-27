@@ -159,17 +159,18 @@ See [`ScheduleQualityRegressionTest.lean`](./SpecimenTest/ScheduleQualityRegress
 **Weight functions** control how often each constructor is chosen at runtime by the backtracking combinator. The `specimen.weightFn` option selects the active weight function. A weight function has the signature:
 
 ```
-CtorWeightFn := Name → List Nat → DeriveSort → Float → Bool → Nat → Nat → Nat → Nat
+CtorWeightFn := Name → List Nat → DeriveSort → Nat → Bool → Nat → Nat → Nat → Nat → Nat
 ```
 
-Arguments: `(ctorName, outputIndices, deriveSort, scoreBadness, isRec, size, numBase, numRec) → weight`
+Arguments: `(ctorName, outputIndices, deriveSort, scoreBadness, isRec, size, numBase, numRec, numRecCalls) → weight`
 - `ctorName`: the fully qualified name of the constructor (e.g. `` `List.cons ``).
 - `outputIndices`: the output position indices for this derivation.
 - `deriveSort`: whether we are deriving a `Generator`, `Enumerator`, `Checker`, or `Theorem`.
-- `scoreBadness`: a [0,1] float from the scorer indicating schedule quality for this constructor (0 = best, 1 = worst). Computed at elaboration time and baked in as a literal.
+- `scoreBadness`: schedule quality for this constructor as a per-mille `Nat` in `0..1000` (0 = best, 1000 = worst). Computed at elaboration time and baked in as a `Nat` literal (rather than a `Float`) so the weight application reduces cleanly. Bucket boundaries that were `0.25 / 0.5 / 0.75` in float terms are `250 / 500 / 750` here.
 - `isRec`: whether this constructor is recursive.
 - `size`: the current generation size parameter (decreases as the generator recurses deeper).
 - `numBase` / `numRec`: counts of base vs recursive constructors for this inductive.
+- `numRecCalls`: the number of size-consuming (recursive / same-inductive) calls made in this constructor's schedule (e.g. a binary-tree `node` ctor has 2). Computed at elaboration time and baked in as a literal — useful for penalizing high-fan-out constructors.
 
 The return value is a `Nat` weight — the backtracking combinator picks constructors proportionally to their weights. The `ctorName`, `outputIndices`, and `deriveSort` arguments enable per-constructor and per-mode weight overrides without needing to write a separate weight function for each type.
 
@@ -197,7 +198,7 @@ import Specimen
 open Scoring Schedules in
 -- Custom weight function: heavily favor base cases
 def myCtorWeight (ctorName : Name) (outputIndices : List Nat) (deriveSort : DeriveSort)
-    (scoreBadness : Float) (isRec : Bool) (size : Nat) (numBase numRec : Nat) : Nat :=
+    (scoreBadness : Nat) (isRec : Bool) (size : Nat) (numBase numRec : Nat) (numRecCalls : Nat) : Nat :=
   if isRec then
     if size == 0 then 0
     else max 1 (size / (max 1 numRec * 4))
@@ -214,13 +215,13 @@ derive_mutual
 ```lean
 open Scoring Schedules in
 def myTargetedWeight (ctorName : Name) (outputIndices : List Nat) (deriveSort : DeriveSort)
-    (scoreBadness : Float) (isRec : Bool) (size : Nat) (numBase numRec : Nat) : Nat :=
+    (scoreBadness : Nat) (isRec : Bool) (size : Nat) (numBase numRec : Nat) (numRecCalls : Nat) : Nat :=
   -- Give a specific constructor a constant low weight
   if ctorName == ``MyType.ExpensiveCtor then 1
   -- Boost another constructor
   else if ctorName == ``MyType.PreferredCtor then 8
   -- Fall back to the default balanced strategy for everything else
-  else balancedCtorWeight ctorName outputIndices deriveSort scoreBadness isRec size numBase numRec
+  else balancedCtorWeight ctorName outputIndices deriveSort scoreBadness isRec size numBase numRec numRecCalls
 ```
 
 The `set_option ... in` scoping means different derivations in the same file can use different weight functions. After changing the weight function, rederive and recompile your file to produce a generator reflecting the new weights.
@@ -228,8 +229,8 @@ The `set_option ... in` scoping means different derivations in the same file can
 **Weight modifiers.** Instead of replacing the entire weight function, you can layer a modifier on top. A `CtorWeightModifier` receives the base weight (already computed by the active weight function) as its first argument and can transform it — multiply, cap, override, or pass through:
 
 ```
-CtorWeightModifier := Nat → Name → List Nat → DeriveSort → Float → Bool → Nat → Nat → Nat → Nat
-                      (baseWeight, ctorName, outputIndices, deriveSort, scoreBadness, isRec, size, numBase, numRec) → finalWeight
+CtorWeightModifier := Nat → Name → List Nat → DeriveSort → Nat → Bool → Nat → Nat → Nat → Nat → Nat
+                      (baseWeight, ctorName, outputIndices, deriveSort, scoreBadness, isRec, size, numBase, numRec, numRecCalls) → finalWeight
 ```
 
 Example — triple the weight for a preferred constructor, halve an expensive one, leave everything else alone:
@@ -237,8 +238,8 @@ Example — triple the weight for a preferred constructor, halve an expensive on
 ```lean
 open Scoring Schedules in
 def myModifier (baseWeight : Nat) (ctorName : Name) (_outputIndices : List Nat)
-    (_deriveSort : DeriveSort) (_scoreBadness : Float) (_isRec : Bool)
-    (_size : Nat) (_numBase _numRec : Nat) : Nat :=
+    (_deriveSort : DeriveSort) (_scoreBadness : Nat) (_isRec : Bool)
+    (_size : Nat) (_numBase _numRec : Nat) (_numRecCalls : Nat) : Nat :=
   if ctorName == ``MyType.PreferredCtor then baseWeight * 3
   else if ctorName == ``MyType.ExpensiveCtor then baseWeight / 2
   else baseWeight
