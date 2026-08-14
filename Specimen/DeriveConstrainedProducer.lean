@@ -1022,8 +1022,44 @@ where
     `structParams` is `(paramName, paramType)` for non-Sort, non-output params.
     The function discovers which leaves actually appear in schedule steps (directly as
     a proj-chain step, or wrapped in a compound type like `List (P.Label)`). -/
+private def propagateDepConstraintsToLeaves
+    (needed : Array (Name × TSyntax `term))
+    (indName : Name) (args : List ConstructorExpr)
+    (structParamNames : Std.HashSet Name)
+    (allLeaves : Array (TSyntax `term))
+    (depConstraintMap : Std.HashMap SpecKey (Array (Name × Name)))
+    : TermElabM (Array (Name × TSyntax `term)) := do
+  let depCs := Id.run do
+    for ds in [DeriveSort.Checker, .Generator, .Enumerator] do
+      let key : SpecKey := { inductiveName := indName, outputIndices := [], deriveSort := ds }
+      if let some cs := depConstraintMap[key]? then
+        if !cs.isEmpty then return cs
+    return #[]
+  if depCs.isEmpty then return needed
+  let some depInfo ← (try pure (some (← getConstInfoInduct indName)) catch _ => pure none)
+    | return needed
+  let depArgTypes ← getComponentsOfArrowType depInfo.type
+  let depArgTypes := depArgTypes.pop
+  -- Check if any of our args at Sort-typed dep positions contain struct-param refs
+  let mut hasStructRef := false
+  for i in [:depArgTypes.size] do
+    if depArgTypes[i]!.isSort then
+      if let some arg := args[i]? then
+        let chains ← collectStructProjChains structParamNames arg
+        if !chains.isEmpty then hasStructRef := true
+  if !hasStructRef then return needed
+  let classes := depCs.map Prod.fst |>.toList.eraseDups
+  let mut result := needed
+  for cls in classes do
+    for leaf in allLeaves do
+      let entry := (cls, leaf)
+      unless result.any (fun p => p.1 == entry.1 && p.2.raw == entry.2.raw) do
+        result := result.push entry
+  return result
+
 def computeStructLeafBinders (allSteps : List ScheduleStep)
     (structParams : Array (Name × Expr))
+    (depConstraintMap : Std.HashMap SpecKey (Array (Name × Name)) := {})
     : TermElabM (Array (Name × TSyntax `term)) := do
   if structParams.isEmpty then return #[]
   let structParamNames : Std.HashSet Name :=
@@ -1032,12 +1068,19 @@ def computeStructLeafBinders (allSteps : List ScheduleStep)
   let mut allLeaves : Array (TSyntax `term) := #[]
   for (paramName, paramType) in structParams do
     allLeaves := allLeaves ++ (← discoverStructLeaves paramName paramType)
-  -- Always emit DecidableEq for all leaves (needed for pattern matching and
-  -- equality checks in generated code — matches old expandStructInstBinders behavior)
+  -- Build fvarLeafMap: fvar name → leaf syntax for fvars produced by direct-leaf steps
+  let mut fvarLeafMap : Std.HashMap Name (TSyntax `term) := {}
+  for step in allSteps do
+    match step with
+    | .Unconstrained varName (.NonRec (indName, args)) _ =>
+      let fullCE := ConstructorExpr.FuncApp indName args
+      if ← isStructProjChain structParamNames fullCE then
+        let argTerms ← args.toArray.mapM (monadLift <| constructorExprToTSyntaxTerm ·)
+        let leafSyn ← `($(mkIdent indName) $argTerms:term*)
+        fvarLeafMap := fvarLeafMap.insert varName leafSyn
+    | _ => pure ()
+  -- Walk schedule steps to discover which leaves need Arbitrary/Enum/DecidableEq
   let mut needed : Array (Name × TSyntax `term) := #[]
-  for leaf in allLeaves do
-    needed := needed.push (``DecidableEq, leaf)
-  -- Walk schedule steps to discover which leaves need Arbitrary/Enum
   for step in allSteps do
     match step with
     | .Unconstrained _ (.NonRec (indName, args)) ps =>
@@ -1099,30 +1142,38 @@ def computeStructLeafBinders (allSteps : List ScheduleStep)
               let entry := (tcName, leaf)
               unless needed.any (fun p => p.1 == entry.1 && p.2.raw == entry.2.raw) do
                 needed := needed.push entry
-    | .Check (.NonRec (indName, _args)) _ =>
-      -- Check steps may compare values whose TYPE is a struct-param leaf (e.g.
-      -- comparing two Metadata values). The args often contain fvars bound by
-      -- earlier Unconstrained steps, not direct projection chains. Conservatively
-      -- emit DecidableEq for all leaves when any Check step exists.
+    | .Check (.NonRec (indName, args)) _ =>
       if indName == ``Eq || indName == ``Ne then
-        for leaf in allLeaves do
-          let entry := (``DecidableEq, leaf)
-          unless needed.any (fun p => p.1 == entry.1 && p.2.raw == entry.2.raw) do
-            needed := needed.push entry
-    | .SuchThat _ (.NonRec (_indName, args)) ps =>
-      let chains ← args.foldlM (fun acc arg =>
-        (· ++ acc) <$> collectStructProjChains structParamNames arg) []
-      if !chains.isEmpty then
-        -- The constrained producer dep needs the producer class on its type params.
-        -- Bubble up the same class for struct-param leaves, matching what
-        -- computeSpecConstraints does for plain type vars.
-        let tcName := match ps with
-          | .Generator => ``Plausible.Arbitrary
-          | .Enumerator => ``Enum
-        for leaf in allLeaves do
-          let entry := (tcName, leaf)
-          unless needed.any (fun p => p.1 == entry.1 && p.2.raw == entry.2.raw) do
-            needed := needed.push entry
+        -- Eq/Ne checks: emit DecidableEq for fvars whose type is a struct-param leaf
+        for arg in args do
+          match arg with
+          | .Unknown varName =>
+            if let some leafSyn := fvarLeafMap[varName]? then
+              let entry := (``DecidableEq, leafSyn)
+              unless needed.any (fun p => p.1 == entry.1 && p.2.raw == entry.2.raw) do
+                needed := needed.push entry
+          | _ => pure ()
+        -- Also check if args directly contain leaf projection chains (not bare param refs)
+        let chains ← args.foldlM (fun acc arg =>
+          (· ++ acc) <$> collectStructProjChains structParamNames arg) []
+        for chain in chains do
+          match chain with
+          | .Unknown _ => pure ()  -- bare param ref, not a leaf
+          | .FuncApp name cArgs => do
+            let ts ← cArgs.toArray.mapM (monadLift <| constructorExprToTSyntaxTerm ·)
+            let leafSyn ← `($(mkIdent name) $ts:term*)
+            let entry := (``DecidableEq, leafSyn)
+            unless needed.any (fun p => p.1 == entry.1 && p.2.raw == entry.2.raw) do
+              needed := needed.push entry
+          | _ => pure ()
+      else
+        -- Other checker relations: propagate constraints from dep
+        needed ← propagateDepConstraintsToLeaves needed indName args structParamNames allLeaves depConstraintMap
+    | .SuchThat _ (.NonRec (indName, args)) ps =>
+      -- Propagate constraints from dep (bubbles up whatever the dep needs)
+      needed ← propagateDepConstraintsToLeaves needed indName args structParamNames allLeaves depConstraintMap
+      -- Note: producer class (Arbitrary/Enum) for leaves is already handled by
+      -- propagateDepConstraintsToLeaves above (it bubbles up whatever the dep needs)
     | _ => pure ()
   return needed
 
@@ -1408,6 +1459,7 @@ def propagateConstraints (components : List (List SpecKey))
 def compileInductiveSchedule (indSched : InductiveSchedule)
     (globalName : Name) (siblings : List (Name × List Nat × Name × DeriveSort))
     (requiredConstraints : Option (Array (Name × Name)) := none)
+    (depConstraintMap : Std.HashMap SpecKey (Array (Name × Name)) := {})
     : TermElabM (TSyntax `command × TSyntax `command) := do
   let key := indSched.key
   let indInfo ← getConstInfoInduct key.inductiveName
@@ -1523,7 +1575,7 @@ def compileInductiveSchedule (indSched : InductiveSchedule)
           sp := sp.push (argNames.getD i `x, liveTypes[i]!)
       sp
     let allSteps := (indSched.baseSchedules ++ indSched.recSchedules).flatMap (fun (_, (steps, _)) => steps)
-    let leafBinderSpecs ← computeStructLeafBinders allSteps structParams
+    let leafBinderSpecs ← computeStructLeafBinders allSteps structParams depConstraintMap
     let structLeafBinders ← structLeafBindersToSyntax leafBinderSpecs
     mkConstrainedProducerMutualPieces
       baseProducers inductiveProducers
@@ -2428,7 +2480,7 @@ def elabDeriveMutual : CommandElab := fun stx => do
               try
                 let specConstraints := constraintMap[key]?
                 let (defCmd, instCmd) ← liftTermElabM <|
-                  compileInductiveSchedule indSched globalName compSiblings specConstraints
+                  compileInductiveSchedule indSched globalName compSiblings specConstraints constraintMap
                 defCmds := defCmds.push defCmd
                 instCmds := instCmds.push instCmd
                 let defStr ← liftTermElabM <| try
