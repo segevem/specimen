@@ -679,4 +679,125 @@ def uniformDensityInductiveAggregator : InductiveAggregator UniformDensityScore 
 initialize registerScoringBundle (mkScorerBundle `Scoring.UniformDensityScore
   uniformDensityStepScorer uniformDensityScheduleScorer uniformDensityLeafAggregator uniformDensityInductiveAggregator)
 
+----------------------------------------------
+-- Built-in: BudgetAwareScore
+-- Like InputAwareGradedScore but additionally penalizes same-inductive
+-- cross-mode calls vs self-recursion. Self-recursion shares the budget
+-- (cheap), while calling a different mode of the same relation invokes
+-- a separate instance (expensive, may cascade).
+----------------------------------------------
+
+/-- Classifies how a recursive/dep call relates to the budget. -/
+inductive Boundedness
+  | Internal    -- self/mutual recursion: shares budget
+  | SameIndExt -- same inductive, different mode/outputs: separate instance
+  | External    -- different inductive entirely
+  deriving Repr, BEq, Inhabited
+
+namespace Boundedness
+
+def toNat : Boundedness → Nat
+  | .Internal => 0
+  | .External => 1
+  | .SameIndExt => 2
+
+instance : Ord Boundedness where
+  compare a b := compare a.toNat b.toNat
+
+def max (a b : Boundedness) : Boundedness := if a.toNat ≥ b.toNat then a else b
+
+end Boundedness
+
+structure BudgetAwareScore where
+  density        : Density := .Total
+  boundedness    : Boundedness := .Internal
+  varDeps        : Nat := 0
+  inputCheckDeps : Nat := 0
+  deriving Repr, BEq, Inhabited
+
+deriving instance TypeName for BudgetAwareScore
+
+instance : Ord BudgetAwareScore where
+  compare a b :=
+    match compare a.density.toNat b.density.toNat with
+    | .eq => match compare a.boundedness.toNat b.boundedness.toNat with
+      | .eq => match compare a.inputCheckDeps b.inputCheckDeps with
+        | .eq => compare a.varDeps b.varDeps
+        | r => r
+      | r => r
+    | r => r
+
+instance : LT BudgetAwareScore := ltOfOrd
+
+instance : Scorable BudgetAwareScore where
+  empty := {}
+  combine a b :=
+    { density := Density.max a.density b.density
+      boundedness := Boundedness.max a.boundedness b.boundedness
+      varDeps := a.varDeps + b.varDeps
+      inputCheckDeps := a.inputCheckDeps + b.inputCheckDeps }
+  isBetter a b := a < b
+  bestOf scores := scores.foldl (fun acc s => if s < acc then s else acc) (scores.headD {})
+  uncoveredPenalty := { density := .Partial, varDeps := 0 }
+  worst := { density := .Checking, boundedness := .SameIndExt, varDeps := 1000, inputCheckDeps := 100 }
+  badness s :=
+    let densityPenalty := s.density.toNat.toFloat / 3.0
+    let boundPenalty := match s.boundedness with
+      | .Internal => 0.0
+      | .External => 0.05
+      | .SameIndExt => 0.2
+    let varDepPenalty := min 0.05 (s.varDeps.toFloat * 0.01)
+    let inputPenalty := min 0.2 (s.inputCheckDeps.toFloat * 0.1)
+    min 1.0 (densityPenalty + boundPenalty + varDepPenalty + inputPenalty)
+
+private def classifyBoundedness (key : SpecKey) (src : Source) : Boundedness :=
+  match src with
+  | .Rec .. | .MutRec .. => .Internal
+  | .NonRec (indName, _) =>
+    if indName == key.inductiveName then .SameIndExt
+    else .External
+
+def budgetAwareStepScorer : StepScorer BudgetAwareScore := fun key memo inputVars step =>
+  match step with
+  | .Unconstrained _ src _ =>
+    { density := .Total, boundedness := classifyBoundedness key src }
+  | .Match .. => { density := .Backtracking }
+  | .Check src _ =>
+    let varDeps := countGeneratedVarDeps inputVars src
+    let inputDeps := if varDeps > 0 then
+      let allVars := match src with
+        | .NonRec (_, args) | .Rec _ args | .MutRec _ args => args.flatMap varsInConstructorExpr
+      allVars.filter inputVars.contains |>.length
+    else 0
+    { density := .Checking, boundedness := classifyBoundedness key src
+      varDeps := varDeps, inputCheckDeps := inputDeps }
+  | .SuchThat outputs src _ =>
+    let outputNames := Std.HashSet.ofList (outputs.map (·.1))
+    let varDeps := countGeneratedVarDeps (inputVars.union outputNames) src
+    let depDensity : Density := match src with
+      | .Rec .. | .MutRec .. => .Partial
+      | .NonRec (indName, args) =>
+        let outputIdxs := outputs.filterMap fun (n, _) =>
+          args.findIdx? fun a => match a with | .Unknown v => v == n | _ => false
+        let depKey : SpecKey := { inductiveName := indName, outputIndices := outputIdxs, deriveSort := key.deriveSort }
+        if depKey == key then .Partial
+        else match memo[depKey]? with
+          | some (.done depSched) => (Score.unwrap BudgetAwareScore depSched.score).density
+          | _ => .Partial
+    { density := depDensity, boundedness := classifyBoundedness key src, varDeps := varDeps }
+
+def budgetAwareScheduleScorer : ScheduleScorer BudgetAwareScore := fun stepScores =>
+  stepScores.foldl Scorable.combine Scorable.empty
+
+def budgetAwareLeafAggregator : LeafAggregator BudgetAwareScore := fun ctors =>
+  match ctors with
+  | [] => Scorable.uncoveredPenalty
+  | _ => Scorable.bestOf (ctors.map Prod.snd)
+
+def budgetAwareInductiveAggregator : InductiveAggregator BudgetAwareScore := fun leafScores =>
+  leafScores.foldl Scorable.combine Scorable.empty
+
+initialize registerScoringBundle (mkScorerBundle `Scoring.BudgetAwareScore
+  budgetAwareStepScorer budgetAwareScheduleScorer budgetAwareLeafAggregator budgetAwareInductiveAggregator)
+
 end Scoring
