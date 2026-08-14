@@ -1539,6 +1539,9 @@ partial def deriveBestInductiveSchedule (key : SpecKey)
   -- 3. Insert inProgress placeholder (cycle detection)
   memo.modify (·.insert key .inProgress)
   let startTime ← IO.monoNanosNow
+  -- Accumulates wall-time (ns) spent in nested on-demand `deriveDep` calls, so we can
+  -- subtract it to record this spec's *self*-time (see `InductiveSchedule.selfTimeUs`).
+  let nestedRef ← IO.mkRef (0 : Nat)
 
   -- 4. Derive schedules for each constructor
   let indInfo ← getConstInfoInduct key.inductiveName
@@ -1579,7 +1582,10 @@ partial def deriveBestInductiveSchedule (key : SpecKey)
           let currentMemo ← memo.get
           let termElabCtx ← readThe Lean.Elab.Term.Context
           let deriveDep : SpecKey → MetaM Unit := fun depKey => do
+            let depStart ← IO.monoNanosNow
             let _ ← (deriveBestInductiveSchedule depKey memo scheduleRewriter).run termElabCtx
+            let depEnd ← IO.monoNanosNow
+            nestedRef.modify (· + (depEnd - depStart))
           let resultOption ← (UnifyM.runInMetaM
             (getProducerScheduleForInductiveConstructor key.inductiveName ctorName
               freshenedOutputNamesTypesIndices freshenedInputNames freshUnknowns
@@ -1618,6 +1624,10 @@ partial def deriveBestInductiveSchedule (key : SpecKey)
     -- 6. Store result
     let endTime ← IO.monoNanosNow
     let elapsed := (endTime - startTime) / 1000
+    -- Self-time = total elapsed minus time delegated to nested `deriveDep` (those deps are
+    -- separate DAG nodes). Clamp to avoid underflow from timing jitter.
+    let nestedUs := (← nestedRef.get) / 1000
+    let selfTime := elapsed - min elapsed nestedUs
     let ctorScoreList := ctorStats.map fun (name, _, _, s) => (name, s)
     let score ← PatternCoverage.computeInductiveScore key.inductiveName key.outputIndices ctorScoreList
     let indSched : InductiveSchedule := {
@@ -1628,6 +1638,7 @@ partial def deriveBestInductiveSchedule (key : SpecKey)
       recSchedules := rec_
       score := score
       derivationTimeUs := elapsed
+      selfTimeUs := selfTime
       ctorStats := ctorStats
     }
     memo.modify (·.insert key (.done indSched))
@@ -2046,12 +2057,22 @@ def setInstanceVisibility (cmd : TSyntax `command) (kind : AttributeKind) : TSyn
     per-component compiled commands together with pretty-printed code for display.
 
     Shared by `derive_mutual` and the `specimen`/`specimen_test` tactic so both emit
-    mutually-recursive components identically. -/
+    mutually-recursive components identically.
+    Compile SCC components to `def`/`instance` syntax.
+    `buildCodeMap` controls whether the generated commands are ALSO pretty-printed to
+    strings (`compiledCodeMap`) — that map is only consumed by the rich HTML widget's
+    "generated code" dropdowns, so we skip the (expensive) `ppCommand` calls when the
+    widget is off. When `specimen.reportParallelCeiling` is set, logs a codegen-vs-pp
+    time split so the two halves of the `codegen+pp` phase can be sized independently. -/
 def compileSpecComponents (components : List (List SpecKey))
     (finalMemo : Std.HashMap SpecKey MemoEntry)
     (constraintMap : Std.HashMap SpecKey (Array Name) := {})
+    (buildCodeMap : Bool := true)
     : CommandElabM (Array (Array (SpecKey × Name) × Array (TSyntax `command) × Array (TSyntax `command))
                     × Std.HashMap SpecKey (String × String)) := do
+  let reportTimers := Lean.Option.get (← getOptions) specimen.reportParallelCeiling
+  let mut codegenNs : Nat := 0
+  let mut ppNs : Nat := 0
   let mut compiledComponents : Array (Array (SpecKey × Name) × Array (TSyntax `command) × Array (TSyntax `command)) := #[]
   let mut compiledCodeMap : Std.HashMap SpecKey (String × String) := {}
   for comp in components do
@@ -2072,23 +2093,31 @@ def compileSpecComponents (components : List (List SpecKey))
         if indSched.alreadyExists then continue
         try
           let specConstraints := constraintMap[key]?
+          let tGen0 ← IO.monoNanosNow
           let (defCmd, instCmd) ← liftTermElabM <|
             compileInductiveSchedule indSched globalName compSiblings specConstraints
+          codegenNs := codegenNs + ((← IO.monoNanosNow) - tGen0)
           defCmds := defCmds.push defCmd
           instCmds := instCmds.push instCmd
-          let defStr ← liftTermElabM <| try
-            let fmt ← Lean.PrettyPrinter.ppCommand defCmd
-            pure fmt.pretty
-          catch _ => pure "(failed to pretty-print def)"
-          let instStr ← liftTermElabM <| try
-            let fmt ← Lean.PrettyPrinter.ppCommand instCmd
-            pure fmt.pretty
-          catch _ => pure "(failed to pretty-print instance)"
-          compiledCodeMap := compiledCodeMap.insert key (defStr, instStr)
+          -- Pretty-print to strings only for the rich widget's code dropdowns.
+          if buildCodeMap then
+            let tPp0 ← IO.monoNanosNow
+            let defStr ← liftTermElabM <| try
+              let fmt ← Lean.PrettyPrinter.ppCommand defCmd
+              pure fmt.pretty
+            catch _ => pure "(failed to pretty-print def)"
+            let instStr ← liftTermElabM <| try
+              let fmt ← Lean.PrettyPrinter.ppCommand instCmd
+              pure fmt.pretty
+            catch _ => pure "(failed to pretty-print instance)"
+            ppNs := ppNs + ((← IO.monoNanosNow) - tPp0)
+            compiledCodeMap := compiledCodeMap.insert key (defStr, instStr)
         catch e =>
           logWarning m!"Failed to compile {key.inductiveName}{key.outputIndices}{repr key.deriveSort}: {e.toMessageData}"
       | _ => logWarning m!"No schedule found for {key.inductiveName}{key.outputIndices}"
     compiledComponents := compiledComponents.push (compMeta, defCmds, instCmds)
+  if reportTimers then
+    logInfo m!"⏱ codegen+pp split (ms): codegen {codegenNs / 1000000}, pp {ppNs / 1000000}{if buildCodeMap then "" else " (pp skipped: richOutput off)"}"
   return (compiledComponents, compiledCodeMap)
 
 /-- Emit compiled SCC components: each multi-def component as a single `mutual … end`
@@ -2155,10 +2184,12 @@ def elabDeriveMutual : CommandElab := fun stx => do
       let autoDerive := Lean.Option.get (← getOptions) specimen.autoDeriveDeps
       if autoDerive then
         let memo ← IO.mkRef ({} : Std.HashMap SpecKey MemoEntry)
+        let tStart ← IO.monoMsNow
         -- Recursively derive schedules for all user specs (populates memo with all deps)
         for (indName, outIdxs, _, ds) in specMeta do
           let key : SpecKey := { inductiveName := indName, outputIndices := outIdxs, deriveSort := ds }
           let _ ← liftTermElabM <| deriveBestInductiveSchedule key memo
+        let tSearch ← IO.monoMsNow
         -- DFS from roots to find actually-used deps
         let finalMemo ← memo.get
         let mut usedKeys : Std.HashSet SpecKey := {}
@@ -2176,6 +2207,75 @@ def elabDeriveMutual : CommandElab := fun stx => do
         -- Use SCC-based compilation from memo
         -- Step 3: SCC decomposition and compilation
         let components := computeSpecSCC usedKeys.toList finalMemo
+        let tSCC ← IO.monoMsNow
+        -- Diagnostic: parallelism ceiling = total self-time / critical-path self-time over
+        -- the SCC condensation DAG (max speedup with unbounded parallel workers).
+        if Lean.Option.get (← getOptions) specimen.reportParallelCeiling then
+          let selfOf (k : SpecKey) : Nat := match finalMemo[k]? with
+            | some (.done s) => s.selfTimeUs
+            | _ => 0
+          let compLabel (comp : List SpecKey) : String := match comp with
+            | [] => "(empty)"
+            | k :: rest =>
+              let base := s!"{k.inductiveName}{k.outputIndices} {repr k.deriveSort}"
+              if rest.isEmpty then base else s!"{base} (+{rest.length} mutual)"
+          -- Include ALL derived specs, not just those reachable from the chosen schedules:
+          -- modes derived while scoring *losing* candidates are still real work. Their
+          -- triggering (losing-candidate) edge isn't recorded, so they appear as parallel
+          -- roots here — an optimistic (upper-bound-on-speedup) placement.
+          let allKeys : List SpecKey := finalMemo.toList.filterMap fun (k, e) =>
+            match e with | .done _ => some k | _ => none
+          let usedTotal := usedKeys.toList.foldl (fun acc k => acc + selfOf k) 0
+          let components := computeSpecSCC allKeys finalMemo
+          -- key → component index
+          let mut keyToComp : Std.HashMap SpecKey Nat := {}
+          let mut idx := 0
+          for comp in components do
+            for k in comp do keyToComp := keyToComp.insert k idx
+            idx := idx + 1
+          -- topo DP for longest weighted path (deps precede dependants in `components`)
+          let compArr := components.toArray
+          let mut weight : Std.HashMap Nat Nat := {}
+          let mut finish : Std.HashMap Nat Nat := {}
+          let mut bestPred : Std.HashMap Nat Nat := {}
+          let mut total : Nat := 0
+          for i in [:compArr.size] do
+            let comp := compArr[i]!
+            let w := comp.foldl (fun acc k => acc + selfOf k) 0
+            weight := weight.insert i w
+            total := total + w
+            let mut best : Nat := 0
+            let mut bestJ : Option Nat := none
+            for k in comp do
+              match finalMemo[k]? with
+              | some (.done indSched) =>
+                let allScheds := indSched.baseSchedules ++ indSched.recSchedules
+                let deps := allScheds.flatMap (fun (_, (steps, _)) => collectNonRecDeps steps)
+                for d in deps do
+                  if d.kind == .relation || d.kind == .checker then
+                    match keyToComp[SpecKey.mk d.inductiveName d.outputIndices d.deriveSort]? with
+                    | some j => if j != i && (finish[j]?.getD 0) > best then
+                        best := finish[j]?.getD 0; bestJ := some j
+                    | none => pure ()
+              | _ => pure ()
+            finish := finish.insert i (w + best)
+            match bestJ with | some j => bestPred := bestPred.insert i j | none => pure ()
+          -- critical path endpoint + backtrack
+          let mut critical : Nat := 0
+          let mut endComp : Nat := 0
+          for i in [:compArr.size] do
+            if finish[i]?.getD 0 > critical then critical := finish[i]?.getD 0; endComp := i
+          let mut pathLabels : List String := []
+          let mut cur : Option Nat := some endComp
+          let mut guard := 0
+          while cur.isSome && guard < compArr.size + 1 do
+            let c := cur.get!
+            pathLabels := pathLabels ++ [s!"{compLabel compArr[c]!} [{weight[c]?.getD 0}μs]"]
+            cur := bestPred[c]?
+            guard := guard + 1
+          let ratioX10 := if critical == 0 then 0 else total * 10 / critical
+          let wasted := total - min total usedTotal
+          logInfo m!"⚡ parallelism ceiling — total self-time {total}μs (used {usedTotal}μs + unused/speculative {wasted}μs), critical path {critical}μs, max speedup ≈ {ratioX10 / 10}.{ratioX10 % 10}× over {compArr.size} SCCs (optimistic: unused modes placed as parallel roots)\ncritical path (dependant→dependency):\n{String.intercalate "\n" pathLabels}"
         -- Print dependency graph + emission order as rich HTML
         let getNumArgs (k : SpecKey) : CommandElabM Nat := liftTermElabM do
           try pure ((← getComponentsOfArrowType (← getConstInfoInduct k.inductiveName).type).size - 1)
@@ -2342,10 +2442,13 @@ def elabDeriveMutual : CommandElab := fun stx => do
                     logWarning m!"derive_mutual: {key.prettyPrint numArgs} needs [{sortStr} ({typeStr})] but no such instance exists"
               | _ => pure ()
           | _ => pure ()
-        let (compiledComponents, compiledCodeMap) ←
-          compileSpecComponents components finalMemo constraintMap
-        -- Build HTML output using ProofWidgets (controlled by specimen.richOutput)
+        let tPreCodegen ← IO.monoMsNow
+        -- The pretty-printed code map is only consumed by the rich widget; skip it otherwise.
         let richOutput := Lean.Option.get (← getOptions) specimen.richOutput
+        let (compiledComponents, compiledCodeMap) ←
+          compileSpecComponents components finalMemo constraintMap (buildCodeMap := richOutput)
+        let tCodegen ← IO.monoMsNow
+        -- Build HTML output using ProofWidgets (controlled by specimen.richOutput)
         let mkSpan (style : Json) (text : String) : Html :=
           .element "span" #[("style", style)] #[.text text]
         let headerStyle := json% {"fontWeight": "bold", "fontSize": "1.2em", "color": "#4fc1ff"}
@@ -2788,7 +2891,11 @@ def elabDeriveMutual : CommandElab := fun stx => do
             else
               logInfo m!"  ● {specDescs.head!}"
         -- Emit compiled components (mutual blocks + instances) — shared with the tactic
+        let tWidget ← IO.monoMsNow
         emitSpecComponents compiledComponents attrKind
+        let tEmit ← IO.monoMsNow
+        if Lean.Option.get (← getOptions) specimen.reportParallelCeiling then
+          logInfo m!"⏱ derive_mutual phases (ms): search {tSearch - tStart}, scc {tSCC - tSearch}, constraints+checks {tPreCodegen - tSCC}, codegen+pp {tCodegen - tPreCodegen}, widget+text {tWidget - tCodegen}, emit/elab {tEmit - tWidget}  |  total {tEmit - tStart}"
       else
         -- Fallback: no auto-derive, use old per-entry compilation
         let siblings := specMeta.toList

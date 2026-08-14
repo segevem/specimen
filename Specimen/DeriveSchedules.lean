@@ -1414,12 +1414,15 @@ partial def searchBestScheduleM (ctorName : Name) (vars : List TypedVar)
     -- Use minTreePruningM to find the best ordering for this component
     let componentDone ← IO.mkRef false
     let componentBestRef ← IO.mkRef (none : Option (List (PreScheduleStep HypothesisExpr Name) × List Name × Std.HashSet Name × Score))
-    let componentWorst := bundle.worstScore
     let envSnapshot := accEnv
     let envSetSnapshot := accEnvSet
 
+    -- Seed the bound with `none` (a true ⊤ that never prunes). Seeding with
+    -- `bundle.worstScore` was unsound: additive score types (e.g. `DefaultScore`)
+    -- can reach a score worse than any finite constant, so the root would be pruned
+    -- against the initial bound, never yielded, and the whole component dropped.
     let _ ← SearchTree.minTreePruningM tree (scoreComponentOrdering envSnapshot envSetSnapshot)
-      bundle.isBetter componentWorst componentDone
+      bundle.isBetter (none : Option Score) componentDone
       fun (ordering, score) currentBest => do
         let c ← countRef.get
         countRef.set (c + 1)
@@ -1436,12 +1439,23 @@ partial def searchBestScheduleM (ctorName : Name) (vars : List TypedVar)
         | some (_, _, _, prevScore) =>
           if bundle.isBetter score prevScore then
             componentBestRef.set (some (compSched, compEnv, compEnvSet, score))
-        -- Return the score for pruning decisions
-        return if bundle.isBetter score currentBest then score else currentBest
+        -- Return the (Option) score bound for pruning decisions
+        return match currentBest with
+          | some cb => if bundle.isBetter score cb then some score else currentBest
+          | none => some score
 
-    -- Use the best ordering found for this component
+    -- Use the best ordering found for this component. With the `none` seed the first
+    -- leaf reached always yields, so `componentBestRef` is set for any non-degenerate
+    -- component (the limit is checked only inside `yield`, so tripping it implies a
+    -- prior yield already recorded a best). A `none` here therefore means the search
+    -- tree produced no leaf at all — an invariant violation, not a normal outcome, so
+    -- we surface it rather than silently dropping the component's hypotheses.
     match ← componentBestRef.get with
-    | none => pure ()
+    | none =>
+      throwError "searchBestScheduleM: branch-and-bound found no schedule for a \
+        component of {key.inductiveName} (ctor {ctorName}, outputIndices \
+        {key.outputIndices}, deriveSort {repr key.deriveSort}). The SCC search tree \
+        yielded no leaf; this is a bug in schedule enumeration."
     | some (compSched, compEnv, compEnvSet, _) =>
       accSched := accSched ++ compSched
       accEnv := compEnv

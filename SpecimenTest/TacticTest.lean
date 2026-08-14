@@ -71,7 +71,7 @@ example (n : Nat) (h : Even n) : Even (n + 2) := by
   specimen
   sorry
 
--- Test 10: `specimen` tactic finds a counterexample
+-- -- Test 10: `specimen` tactic finds a counterexample
 /--
 error: Found counter-example!
   n : Nat := 0

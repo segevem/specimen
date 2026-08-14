@@ -501,14 +501,24 @@ def enumDependencySatisfyingOrderingsWithAdvancedPruning {α v} [BEq α] [Repr �
     Explores best-first (children sorted by score), prunes when partial score exceeds best.
     - `score`: monadic scoring function (may trigger on-demand dep derivation)
     - `isBetter`: returns true if first arg is strictly better than second
+    - `bestScore`: the current bound as an `Option`. `none` is a true ⊤ that never
+      prunes — it is the correct initial seed. Do NOT seed with a concrete "worst"
+      score: for additive score types (e.g. `DefaultScore`, whose `checks` accumulate
+      transitively across the dependency DAG) a genuinely reachable schedule can exceed
+      any finite constant, so seeding with such a constant would prune the root against
+      the initial bound, never `yield`, and silently drop the whole component.
     - `done`: IO.Ref flag; consumer sets to `true` to stop exploration
     - `yield`: callback receiving (leaf value, its score) and current best; returns updated best -/
 partial def minTreePruningM [Monad m] [MonadLiftT BaseIO m] {α σ : Type}
-    (tree : LazyRoseTree α) (score : α → m σ) (isBetter : σ → σ → Bool) (bestScore : σ)
-    (done : IO.Ref Bool) (yield : (α × σ) → σ → m σ) : m σ := do
+    (tree : LazyRoseTree α) (score : α → m σ) (isBetter : σ → σ → Bool) (bestScore : Option σ)
+    (done : IO.Ref Bool) (yield : (α × σ) → Option σ → m (Option σ)) : m (Option σ) := do
   if ← liftM (m := BaseIO) done.get then return bestScore
   let nodeScore ← score tree.val
-  if isBetter bestScore nodeScore then return bestScore
+  -- Prune only against a real bound; the initial `none` bound never prunes, so the
+  -- first leaf reached always yields and the component can never be dropped.
+  match bestScore with
+  | some b => if isBetter b nodeScore then return bestScore
+  | none => pure ()
   let children := tree.children.get
   if children.isEmpty then
     yield (tree.val, nodeScore) bestScore

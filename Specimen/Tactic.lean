@@ -1268,9 +1268,20 @@ unsafe def evalSpecimenTac : Tactic := fun stx => do
     let cmdStx ← match cfg with
       | some c => `(command| specimen_test $c:sizeConfig $tgtStx:term)
       | none => `(command| specimen_test $tgtStx:term)
-    -- Snapshot the environment; run the test; restore so derived defs don't leak
+    -- Snapshot the environment; run the test; restore so derived defs don't leak.
+    --
+    -- When `specimen` runs *inside* a proof (after `intro`, inside a `have`, …), the
+    -- enclosing declaration is elaborated on an async branch whose environment
+    -- restricts `addDecl` to the current declaration's name prefix (see
+    -- `Environment.AsyncContext.mayContain`). specimen's derived generators/checkers
+    -- are named after their *types*, not the current decl, so `addDecl` would panic
+    -- ("restricted to the prefix …"). We only need those defs transiently — the goal
+    -- is left open and `savedEnv` is restored below — so clear the async restriction
+    -- for the scratch derivation. This lets `specimen` work deep inside a proof
+    -- without the caller having to `set_option Elab.async false`.
     let savedEnv ← getEnv
     try
+      modifyEnv (·.unlockAsync)
       runCommandElabMInCore (Lean.Elab.Command.elabCommand cmdStx)
       setEnv savedEnv
     catch e =>

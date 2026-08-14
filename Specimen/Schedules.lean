@@ -508,6 +508,10 @@ structure InductiveSchedule where
   alreadyExists : Bool := false
   /-- Time taken to derive the full spec (in microseconds, includes dep derivation) -/
   derivationTimeUs : Nat := 0
+  /-- Self-time (microseconds): this spec's own search, EXCLUDING time spent in nested
+      on-demand `deriveDep` derivations (which are separate nodes in the dependency DAG).
+      Used to compute the parallelism ceiling (critical path over the SCC condensation). -/
+  selfTimeUs : Nat := 0
   /-- Per-constructor stats: (name, time in μs, schedules considered, score) -/
   ctorStats : List (Name × Nat × Nat × Score) := []
   deriving Repr

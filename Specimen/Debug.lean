@@ -61,6 +61,14 @@ register_option specimen.precomputeWeights : Bool := {
   descr := "partially evaluate constructor weight functions under the size binder at elaboration time"
 }
 
+/-- When true, `derive_mutual` logs a parallelism-ceiling summary after deriving: the total
+    self-time across all specs, the critical-path self-time through the SCC dependency DAG, and
+    their ratio (the maximum speedup achievable with unbounded parallel workers). Diagnostic only. -/
+register_option specimen.reportParallelCeiling : Bool := {
+  defValue := false
+  descr := "log the parallelism ceiling (total vs critical-path self-time) after derive_mutual"
+}
+
 /-- Whether the `specimen`/`specimen_test` shrinker attempts to minimize counterexamples. -/
 register_option specimen.shrink : Bool := {
   defValue := true

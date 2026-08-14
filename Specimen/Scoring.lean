@@ -557,7 +557,40 @@ def getActiveScorerBundle : MetaM ScorerBundle := do
 -- Built-in: default strategy (sum of best)
 ----------------------------------------------
 
-def defaultStepScorer : StepScorer DefaultScore := fun _key memo _inputVars step => do
+-- Scores only this schedule's own steps. It deliberately does NOT fold in the scores
+-- of sub-relation dependencies: doing so made `checks`/`unconstrained` accumulate
+-- transitively across the dependency DAG (each referencing step re-added a dep's full
+-- total), so the metric grew geometrically with dependency depth and could exceed any
+-- finite bound. Keeping it local makes the score bounded by this constructor's own
+-- hypothesis count and keeps the ordering a purely structural, per-schedule heuristic.
+def defaultStepScorer : StepScorer DefaultScore := fun _key _memo _inputVars step => do
+  return match step with
+    | .Check .. => { checks := 1, length := 1 }
+    | .Unconstrained .. => { length := 1, unconstrained := 1 }
+    | .SuchThat .. => { length := 1 }
+    | .Match .. => { length := 1 }
+
+def defaultScheduleScorer : ScheduleScorer DefaultScore := fun stepScores =>
+  stepScores.foldl Scorable.combine Scorable.empty
+
+def defaultLeafAggregator : LeafAggregator DefaultScore := fun ctors =>
+  match ctors with
+  | [] => Scorable.uncoveredPenalty
+  | _ => Scorable.bestOf (ctors.map Prod.snd)
+
+def defaultInductiveAggregator : InductiveAggregator DefaultScore := fun leafScores =>
+  leafScores.foldl Scorable.combine Scorable.empty
+
+initialize registerScoringBundle (mkScorerBundle `Scoring.DefaultScore
+  defaultStepScorer defaultScheduleScorer defaultLeafAggregator defaultInductiveAggregator)
+
+/-- The original dependency-accumulating default step scorer, retained for comparison.
+    For each step it folds in the *whole-schedule* score of every `relation`/`checker`
+    dependency pulled from the memo, so `checks`/`unconstrained` accumulate transitively
+    across the dependency DAG. This makes the score sensitive to sub-relation cost, but
+    the metric is unbounded (it grows geometrically with dependency depth). Selectable
+    via `set_option specimen.scoreType "Scoring.DepAwareDefaultScore"`. -/
+def depAwareDefaultStepScorer : StepScorer DefaultScore := fun _key memo _inputVars step => do
   let baseScore : DefaultScore := match step with
     | .Check .. => { checks := 1, length := 1 }
     | .Unconstrained .. => { length := 1, unconstrained := 1 }
@@ -578,19 +611,8 @@ def defaultStepScorer : StepScorer DefaultScore := fun _key memo _inputVars step
       else acc) {}
   return Scorable.combine baseScore depCost
 
-def defaultScheduleScorer : ScheduleScorer DefaultScore := fun stepScores =>
-  stepScores.foldl Scorable.combine Scorable.empty
-
-def defaultLeafAggregator : LeafAggregator DefaultScore := fun ctors =>
-  match ctors with
-  | [] => Scorable.uncoveredPenalty
-  | _ => Scorable.bestOf (ctors.map Prod.snd)
-
-def defaultInductiveAggregator : InductiveAggregator DefaultScore := fun leafScores =>
-  leafScores.foldl Scorable.combine Scorable.empty
-
-initialize registerScoringBundle (mkScorerBundle `Scoring.DefaultScore
-  defaultStepScorer defaultScheduleScorer defaultLeafAggregator defaultInductiveAggregator)
+initialize registerScoringBundle (mkScorerBundle `Scoring.DepAwareDefaultScore
+  depAwareDefaultStepScorer defaultScheduleScorer defaultLeafAggregator defaultInductiveAggregator)
 
 ----------------------------------------------
 -- Built-in: worst-leaf strategy
@@ -1503,6 +1525,25 @@ end CallLocality
 
 structure BudgetAwareScore where
   density        : Density := .Total
+  /-- Number of steps that *fabricate* an intermediate rather than derive it:
+      in a checker/enumerator, a value produced by an unconstrained (`Total`-density)
+      producer is a generate-and-test — it invents a value that a later check must
+      confirm. Over a recursive/unbounded domain (e.g. record types) that search is
+      unbounded, so we must prefer schedules that *derive* the value (e.g. infer a
+      sub-term's type via the type relation) over ones that fabricate-and-check.
+      Ranked just under `density` (which ties at `Checking` for all checkers) and
+      above `locality`, since the fabrication risk dominates the cross-mode-call cost. -/
+  fabrication    : Nat := 0
+  /-- Number of times a variable is produced by an *open* source (recursion or
+      `Arbitrary`/unconstrained) while a *selective* relation elsewhere in the
+      schedule pins that same variable to a finite set (a ground argument position
+      across all of the relation's constructors). This is a generate-and-test that
+      `fabrication` misses: the producer is a legitimate recursive/enumeration
+      producer (not a checker fabrication), and the constraint appears as a
+      *producer* of a different output (e.g. `HasTypeCall` producing `xfn`) rather
+      than a `check`. Preferring to produce the variable from its finite-domain
+      relation is the "most-constrained-producer" rule. Ranked with `fabrication`. -/
+  selectivity    : Nat := 0
   locality       : CallLocality := .Internal
   varDeps        : Nat := 0
   inputCheckDeps : Nat := 0
@@ -1512,10 +1553,19 @@ deriving instance TypeName for BudgetAwareScore
 
 instance : Ord BudgetAwareScore where
   compare a b :=
-    match compare a.density.toNat b.density.toNat with
-    | .eq => match compare a.locality.toNat b.locality.toNat with
-      | .eq => match compare a.inputCheckDeps b.inputCheckDeps with
-        | .eq => compare a.varDeps b.varDeps
+    -- `selectivity` (most-constrained-producer regret) ranks *above* `density`:
+    -- it only fires when a variable that some relation ground-pins is produced from
+    -- a looser source, and in exactly those cases the pinning producer is also the
+    -- more-terminating choice — so density's reward for free production is wrong
+    -- there. Everywhere selectivity ties (the common case), density decides as before.
+    match compare a.selectivity b.selectivity with
+    | .eq => match compare a.density.toNat b.density.toNat with
+      | .eq => match compare a.fabrication b.fabrication with
+        | .eq => match compare a.locality.toNat b.locality.toNat with
+          | .eq => match compare a.inputCheckDeps b.inputCheckDeps with
+            | .eq => compare a.varDeps b.varDeps
+            | r => r
+          | r => r
         | r => r
       | r => r
     | r => r
@@ -1526,22 +1576,28 @@ instance : Scorable BudgetAwareScore where
   empty := {}
   combine a b :=
     { density := Density.max a.density b.density
+      fabrication := a.fabrication + b.fabrication
+      selectivity := a.selectivity + b.selectivity
       locality := CallLocality.max a.locality b.locality
       varDeps := a.varDeps + b.varDeps
       inputCheckDeps := a.inputCheckDeps + b.inputCheckDeps }
   isBetter a b := a < b
   bestOf scores := scores.foldl (fun acc s => if s < acc then s else acc) (scores.headD {})
   uncoveredPenalty := { density := .Partial, varDeps := 0 }
-  worst := { density := .Checking, locality := .SameIndExt, varDeps := 1000, inputCheckDeps := 100 }
+  worst := { density := .Checking, fabrication := 100, selectivity := 100, locality := .SameIndExt, varDeps := 1000, inputCheckDeps := 100 }
   badness s :=
+    -- `selectivity` dominates (matches the ordering): scaled so any regret outweighs
+    -- the full density range, so pruning never discards a lower-regret schedule.
+    let selectivityPenalty := min 0.6 (s.selectivity.toFloat * 0.6)
     let densityPenalty := s.density.toNat.toFloat / 3.0
+    let fabricationPenalty := min 0.3 (s.fabrication.toFloat * 0.15)
     let localityPenalty := match s.locality with
       | .Internal => 0.0
       | .External => 0.05
       | .SameIndExt => 0.2
     let varDepPenalty := min 0.05 (s.varDeps.toFloat * 0.01)
     let inputPenalty := min 0.2 (s.inputCheckDeps.toFloat * 0.1)
-    min 1.0 (densityPenalty + localityPenalty + varDepPenalty + inputPenalty)
+    min 1.0 (selectivityPenalty + densityPenalty + fabricationPenalty + localityPenalty + varDepPenalty + inputPenalty)
 
 private def classifyLocality (key : SpecKey) (src : Source) : CallLocality :=
   match src with
@@ -1551,9 +1607,14 @@ private def classifyLocality (key : SpecKey) (src : Source) : CallLocality :=
     else .External
 
 def budgetAwareStepScorer : StepScorer BudgetAwareScore := fun key memo inputVars step => do
+  -- Checkers/enumerators verify a (mostly) fixed proposition, so any value they
+  -- produce via an unconstrained/`Total` producer is fabricated and must be
+  -- confirmed downstream — a generate-and-test. Flag those as `fabrication`.
+  let isChecker := key.deriveSort == .Checker || key.deriveSort == .Enumerator
   match step with
   | .Unconstrained _ src _ =>
-    return { density := .Total, locality := classifyLocality key src }
+    return { density := .Total, locality := classifyLocality key src,
+             fabrication := if isChecker then 1 else 0 }
   | .Match .. => return { density := .Backtracking }
   | .Check src _ =>
     let varDeps := countGeneratedVarDeps inputVars src
@@ -1566,17 +1627,37 @@ def budgetAwareStepScorer : StepScorer BudgetAwareScore := fun key memo inputVar
   | .SuchThat outputs src _ =>
     let outputNames := Std.HashSet.ofList (outputs.map (·.1))
     let varDeps := countGeneratedVarDeps (inputVars.union outputNames) src
+    let outputIdxs : List Nat := match src with
+      | .NonRec (_, args) => outputs.filterMap fun (n, _) =>
+          args.findIdx? fun a => match a with | .Unknown v => v == n | _ => false
+      | _ => []
     let depDensity : Density := match src with
       | .Rec .. | .MutRec .. => .Partial
-      | .NonRec (indName, args) =>
-        let outputIdxs := outputs.filterMap fun (n, _) =>
-          args.findIdx? fun a => match a with | .Unknown v => v == n | _ => false
+      | .NonRec (indName, _) =>
         let depKey : SpecKey := { inductiveName := indName, outputIndices := outputIdxs, deriveSort := key.deriveSort }
         if depKey == key then .Partial
         else match memo[depKey]? with
           | some (.done depSched) => (Score.unwrap BudgetAwareScore depSched.score).density
           | _ => .Partial
-    return { density := depDensity, locality := classifyLocality key src, varDeps := varDeps }
+    -- Fabrication propagation. Producing an output via a sub-relation and then
+    -- confirming it downstream is a generate-and-test; over a recursive/unbounded
+    -- domain that search is unbounded. We detect it by reading the *producer*
+    -- (enumerator) mode's own `fabrication` count rather than proxying via
+    -- `density == .Total`: a fabricator like `HasAttrInRecord ∃ a` fabricates one
+    -- output (the record type) yet also runs checks, so its aggregate density is
+    -- `.Checking`, not `.Total` — the density proxy misses it, but its
+    -- `fabrication` field is already nonzero. Look this up in `.Enumerator` mode
+    -- (the parent's `deriveSort` would query a non-producing key). `.Rec/.MutRec`
+    -- self-calls are legitimate recursion, not fabrication.
+    let producingFab : Nat := match src with
+      | .Rec .. | .MutRec .. => 0
+      | .NonRec (indName, _) =>
+        let enumKey : SpecKey := { inductiveName := indName, outputIndices := outputIdxs, deriveSort := .Enumerator }
+        match memo[enumKey]? with
+        | some (.done s) => (Score.unwrap BudgetAwareScore s.score).fabrication
+        | _ => 0
+    let fabrication := if isChecker then producingFab else 0
+    return { density := depDensity, fabrication := fabrication, locality := classifyLocality key src, varDeps := varDeps }
 
 def budgetAwareScheduleScorer : ScheduleScorer BudgetAwareScore := fun stepScores =>
   stepScores.foldl Scorable.combine Scorable.empty
@@ -1589,7 +1670,89 @@ def budgetAwareLeafAggregator : LeafAggregator BudgetAwareScore := fun ctors =>
 def budgetAwareInductiveAggregator : InductiveAggregator BudgetAwareScore := fun leafScores =>
   leafScores.foldl Scorable.combine Scorable.empty
 
-initialize registerScoringBundle (mkScorerBundle `Scoring.BudgetAwareScore
-  budgetAwareStepScorer budgetAwareScheduleScorer budgetAwareLeafAggregator budgetAwareInductiveAggregator)
+/-- Cache of finite-pinned argument positions per relation (keyed by name). -/
+initialize budgetFinitePinCache : IO.Ref (Std.HashMap Name (List Nat)) ← IO.mkRef {}
+
+/-- Argument positions a relation pins to a *finite* set: positions whose term is
+    ground (no free variables) in the conclusion of *every* constructor. E.g.
+    `HasTypeCall` pins the function, arg-type list, and result type (each a literal
+    in every constructor) but not the argument expressions. Cached; any analysis
+    failure falls back to `[]` (no pins), which is safe (disables the penalty). -/
+def finitePinnedArgPositions (relName : Name) : MetaM (List Nat) := do
+  if let some cached := (← budgetFinitePinCache.get)[relName]? then
+    return cached
+  let result : List Nat ← try
+    match (← getEnv).find? relName with
+    | some (.inductInfo ind) =>
+      let mut acc : Option (Array Bool) := none
+      for ctorName in ind.ctors do
+        let ci ← getConstInfo ctorName
+        let grounds : Array Bool ← forallTelescopeReducing ci.type fun _ concl => do
+          let (_, args) ← exprToHypothesisExpr ctorName concl
+          pure ((args.map (fun a => (varsInConstructorExpr a).isEmpty)).toArray)
+        acc := some (match acc with
+          | none => grounds
+          | some prev =>
+            let n := min prev.size grounds.size
+            ((List.range n).map (fun i => prev[i]! && grounds[i]!)).toArray)
+      pure (match acc with
+        | none => ([] : List Nat)
+        | some arr => (List.range arr.size).filter (fun i => arr[i]!))
+    | _ => pure ([] : List Nat)
+  catch _ => pure ([] : List Nat)
+  budgetFinitePinCache.modify (·.insert relName result)
+  return result
+
+/-- Whole-schedule scorer for `BudgetAwareScore`. Computes the per-step terms
+    exactly as `budgetAwareStepScorer`/`budgetAwareScheduleScorer`, then adds the
+    cross-step `selectivity` term: a variable produced by an *open* source
+    (recursion or `Arbitrary`) is penalized once for each ground-pinned argument
+    position of a `NonRec` relation elsewhere in the schedule that holds it —
+    i.e. it was produced freely when a finite-domain relation constrains it, so it
+    should have been produced from that relation instead. -/
+def budgetAwareWholeScheduleScorer : ResolvedWholeScheduleScorer := fun key memo inputVars steps => do
+  let stepScores ← steps.mapM fun step => budgetAwareStepScorer key memo inputVars step
+  let base : BudgetAwareScore := stepScores.foldl Scorable.combine Scorable.empty
+  -- Which variables this schedule produces, and which are produced *finitely*
+  -- (an output of a `NonRec` relation that ground-pins that output's position).
+  let mut allProduced : Std.HashSet Name := {}
+  let mut producedFinitely : Std.HashSet Name := {}
+  for step in steps do
+    match step with
+    | .Unconstrained name _ _ => allProduced := allProduced.insert name
+    | .SuchThat outputs src _ =>
+      for (n, _) in outputs do allProduced := allProduced.insert n
+      match src with
+      | .NonRec (relName, args) =>
+        let pinned ← finitePinnedArgPositions relName
+        for (n, _) in outputs do
+          if pinned.any (fun i => match args[i]? with | some (.Unknown v) => v == n | _ => false) then
+            producedFinitely := producedFinitely.insert n
+      | _ => pure ()
+    | _ => pure ()
+  -- Variables that *some* `NonRec` relation ground-pins (⇒ finitely producible).
+  let mut finitePinnable : Std.HashSet Name := {}
+  for step in steps do
+    let srcOpt : Option Source := match step with
+      | .SuchThat _ src _ => some src | .Check src _ => some src | _ => none
+    match srcOpt with
+    | some (.NonRec (relName, args)) =>
+      let pinned ← finitePinnedArgPositions relName
+      for i in pinned do
+        match args[i]? with
+        | some (.Unknown v) => finitePinnable := finitePinnable.insert v
+        | _ => pure ()
+    | _ => pure ()
+  -- Regret: a produced, finitely-producible variable that was *not* produced finitely.
+  let mut selectivity : Nat := 0
+  for v in finitePinnable.toList do
+    if allProduced.contains v && !producedFinitely.contains v then
+      selectivity := selectivity + 1
+  return Score.wrap { base with selectivity := selectivity }
+
+initialize do
+  let base := mkScorerBundle `Scoring.BudgetAwareScore
+    budgetAwareStepScorer budgetAwareScheduleScorer budgetAwareLeafAggregator budgetAwareInductiveAggregator
+  registerScoringBundle { base with wholeScheduleScorer := some budgetAwareWholeScheduleScorer }
 
 end Scoring
