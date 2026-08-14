@@ -555,16 +555,16 @@ def getScheduleForInductiveRelationConstructor
           | .lcons fstSchdM rest =>
           let (fstSchd, countSeen) ← fstSchdM
           let inputVarSet := Std.HashSet.ofList fixedVars
-          let scoreSchedule := fun (steps : List ScheduleStep) =>
-            let stepScores := steps.map fun step => bundle.stepScorer key depMemo inputVarSet step
-            bundle.scheduleScorer stepScores
+          let scoreSchedule := fun (steps : List ScheduleStep) => do
+            let stepScores ← steps.mapM fun step => bundle.stepScorer key depMemo inputVarSet step
+            return bundle.scheduleScorer stepScores
           let mut countProcessed := 1
-          let mut bestScore := scoreSchedule fstSchd
+          let mut bestScore ← scoreSchedule fstSchd
           let mut bestSchedule := fstSchd
           trace[plausible.deriving.results] m!"First Schedule: {ppScheduleSteps bestSchedule} \nScore: {bundle.reprScore bestScore}\nSchedules Considered: {repr countSeen}\nSchedules Processed: {repr countProcessed}"
           for schdM in rest.get do
             let (schd, countSeen) ← schdM
-            let score := scoreSchedule schd
+            let score ← scoreSchedule schd
             countProcessed := countProcessed + 1
             if bundle.isBetter score bestScore then
               bestSchedule := schd
@@ -839,7 +839,19 @@ def compileInductiveSchedule (indSched : InductiveSchedule)
         | .SuchThat vs (.Rec _ args) ps => .SuchThat vs (.Rec globalName args) ps
         | .Check (.Rec _ args) pol => .Check (.Rec globalName args) pol
         | other => other
-    for (_, schedule) in indSched.baseSchedules do
+    let bundle ← Scoring.getActiveScorerBundle
+    let lookupCtorScore (ctorName : Name) : Array Nat :=
+      match indSched.ctorStats.find? (fun (n, _, _, _) => n == ctorName) with
+      | some (_, _, _, s) => bundle.ctorWeightArgs s
+      | none => #[1, 0, 0, 0]
+    -- Pre-compute numBase/numRec for ctorWeight (need to know which base schedules use mutual calls)
+    let numBaseMutual := indSched.baseSchedules.filter (fun (_, (steps, _)) =>
+      scheduleUsesMutualCall (rewriteSchedule steps))
+    let numBase := indSched.baseSchedules.length - numBaseMutual.length
+    let numRec := indSched.recSchedules.length + numBaseMutual.length
+    let numBaseLit := Syntax.mkNumLit (toString numBase)
+    let numRecLit := Syntax.mkNumLit (toString numRec)
+    for (ctorName, schedule) in indSched.baseSchedules do
       let (steps, sort) := schedule
       let rewrittenSteps := rewriteSchedule steps
       let rewrittenSchedule := (rewrittenSteps, sort)
@@ -849,17 +861,29 @@ def compileInductiveSchedule (indSched : InductiveSchedule)
         MExp.mexpToTSyntax mexp key.deriveSort)
       if scheduleUsesMutualCall rewrittenSteps then
         let term ← match key.deriveSort with
-          | .Generator => `( ($(Lean.mkIdent ``Nat.succ) $freshSize', $subProducer) )
+          | .Generator =>
+            let ws := lookupCtorScore ctorName
+            let dLit := Syntax.mkNumLit (toString ws[0]!)
+            let sLit := Syntax.mkNumLit (toString ws[1]!)
+            let lLit := Syntax.mkNumLit (toString ws[2]!)
+            let vLit := Syntax.mkNumLit (toString ws[3]!)
+            `( (Scoring.ctorWeight $dLit $sLit $lLit $vLit true $freshSize' $numBaseLit $numRecLit, $subProducer) )
           | .Enumerator => pure subProducer
           | .Checker | .Theorem => `(fun (_ : Unit) => $subProducer)
         recursiveProducers := recursiveProducers.push term
       else
         let term ← match key.deriveSort with
-          | .Generator => `( (1, $subProducer) )
+          | .Generator =>
+            let ws := lookupCtorScore ctorName
+            let dLit := Syntax.mkNumLit (toString ws[0]!)
+            let sLit := Syntax.mkNumLit (toString ws[1]!)
+            let lLit := Syntax.mkNumLit (toString ws[2]!)
+            let vLit := Syntax.mkNumLit (toString ws[3]!)
+            `( (Scoring.ctorWeight $dLit $sLit $lLit $vLit false 0 $numBaseLit $numRecLit, $subProducer) )
           | .Enumerator => pure subProducer
           | .Checker | .Theorem => `(fun (_ : Unit) => $subProducer)
         nonRecursiveProducers := nonRecursiveProducers.push term
-    for (_, schedule) in indSched.recSchedules do
+    for (ctorName, schedule) in indSched.recSchedules do
       let (steps, sort) := schedule
       let rewrittenSchedule := (rewriteSchedule steps, sort)
       let (subProducer, _) ← StateT.run (s := #[]) (do
@@ -867,7 +891,13 @@ def compileInductiveSchedule (indSched : InductiveSchedule)
           (fuelPrimeName := freshFuelPrimeName) (sizePrimeName := freshSizePrimeName)
         MExp.mexpToTSyntax mexp key.deriveSort)
       let term ← match key.deriveSort with
-        | .Generator => `( ($(Lean.mkIdent ``Nat.succ) $freshSize', $subProducer) )
+        | .Generator =>
+          let ws := lookupCtorScore ctorName
+          let dLit := Syntax.mkNumLit (toString ws[0]!)
+          let sLit := Syntax.mkNumLit (toString ws[1]!)
+          let lLit := Syntax.mkNumLit (toString ws[2]!)
+          let vLit := Syntax.mkNumLit (toString ws[3]!)
+          `( (Scoring.ctorWeight $dLit $sLit $lLit $vLit true $freshSize' $numBaseLit $numRecLit, $subProducer) )
         | .Enumerator => pure subProducer
         | .Checker | .Theorem => `(fun (_ : Unit) => $subProducer)
       recursiveProducers := recursiveProducers.push term

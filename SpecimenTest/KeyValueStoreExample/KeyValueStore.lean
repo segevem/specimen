@@ -83,7 +83,7 @@ Notes about the way these are expressed:
 /-- `AddKV k v s1 s2` holds if state `s1` is the same as `s2` where the latter has the pair `(k,v)`
      added at version .zero, bumping the versions of prior pairs with `k`. -/
 inductive AddKV : String → String → List (String × String) → List (String × String) → Prop where
-| ANil : ∀ k v s, k = k → s = s → v = v → AddKV k v s ((k, v)::s)
+| ANil : ∀ k v s, AddKV k v s ((k, v)::s)
 
 /-- Helper function used to improve the generator's success rate. -/
 def ver (k1 : String) (k2 : String) (n : Nat) : Nat :=
