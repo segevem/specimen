@@ -2,6 +2,7 @@ import Specimen.Correctness.SuccObs
 import Specimen.Debug
 import Specimen.Correctness.CheckHyps
 import Specimen.Correctness.ParallelBlock
+import Specimen.Correctness.StepOf
 
 /-!
 # A derived worker is sound for its relation
@@ -407,18 +408,53 @@ def proveSoundParallel (items : Array (Name × Name × Array Nat)) (facts : Arra
   let factsAll : Syntax.TSepArray `term "," := Syntax.TSepArray.ofElems (ihs ++ facts ++ generic)
   let block := ws[0]!.1 ++ `sound_block
   let stmts := ws.map fun (w, _, st) => (w, st)
+  -- The workers' own fuel-`0` and fuel-`f+1` equations, by `rfl`, where they are to be had: the
+  -- reserved `eq_def` a proof would otherwise generate costs seconds for a large block.
+  let cheap ← liftTermElabM <| items.mapM fun (wN, _, _) => do
+    try specimenBody wN catch _ => pure ()
+    let env ← getEnv
+    return env.contains (wN ++ `eq_zero) && env.contains (wN ++ `eq_body)
   proveBlockParallel stmts "sound" block
     (fun i => do
+      if cheap[i]! then
+        let z := mkIdent (ws[i]!.1 ++ `eq_zero)
+        return ← `(tactic| (intros; rw [$z:ident]; walk))
       let eq := mkIdent ws[i]!.2.1
       `(tactic| (intros; rw [$eq:ident]; walk)))
     (fun i => do
       let eq := mkIdent ws[i]!.2.1
+      let unfoldStep ← if cheap[i]! then
+          let eb := mkIdent (ws[i]!.1 ++ `eq_body)
+          let bd := mkIdent (ws[i]!.1 ++ `body)
+          `(tactic| (rw [$eb:ident]; delta $bd:ident))
+        else `(tactic| rw [$eq:ident])
       `(tactic| (
         intros
-        rw [$eq:ident]
+        log_time "srw" ($unfoldStep:tactic)
+        log_time "sunfold" (unfold_gen_instances [$factsAll,*])
+        log_time "swalk" (walk [$factsAll,*])
+        log_time "sleaves" (all_goals ((log_time "scheck" (try check_hyps [$factsAll,*])); log_time "sctor" ctor_leaf)))))
+    -- each step split by the alternatives of its backtrack, proved in parallel
+    (fun i => do
+      unless cheap[i]! do return none
+      if (← IO.getEnv "SPECIMEN_SOUND_SPLIT").isNone then return none
+      let eb := mkIdent (ws[i]!.1 ++ `eq_body)
+      let bd := mkIdent (ws[i]!.1 ++ `body)
+      let pre ← `(tactic| (
+        intros
+        rw [$eb:ident]
+        delta $bd:ident
+        split <;> (
+          refine succ_spec_backtrack_of_all ?_
+          try simp only [List.map_cons, List.map_nil, List.foldr_cons, List.foldr_nil]
+          repeat' apply And.intro)
+        all_goals first | exact True.intro | (show succObs.spec _ _)))
+      let part ← `(tactic| (
+        try dsimp only
         unfold_gen_instances [$factsAll,*]
         walk [$factsAll,*]
-        all_goals ((try check_hyps [$factsAll,*]); ctor_leaf))))
+        all_goals ((try check_hyps [$factsAll,*]); ctor_leaf)))
+      return some (pre, part))
   liftTermElabM <| splitBlock block [] stmts `sound
   return true
 

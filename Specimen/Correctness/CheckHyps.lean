@@ -108,6 +108,9 @@ partial def rejected (facts : Array Expr) (unfolds : Array (Name × Name)) (hN :
       rejected facts unfolds hN
   let _ := facts; let _ := unfolds
 
+/-- The head of the hypothesis of each constant fact (`headOf` its last premise), computed once. -/
+initialize factHeadCache : IO.Ref (Std.HashMap Name (Option Name)) ← IO.mkRef {}
+
 /-- Break the hypotheses `h : X = .ok true` about a checker's run into what they establish: a branch of
 `checkerBacktrack`, each conjunct of `andOptList`, a `match` split, a decided proposition, and, through
 `facts` (the recursion's hypothesis and the callees' laws `W … = .ok true → R …`), the relation of a
@@ -249,17 +252,53 @@ partial def checkHyps (facts : Array Expr) (unfolds : Array (Name × Name) := #[
     l.getAppFn.constName?
   let lhsHead := lhs.getAppFn.constName?
   let viaInstance := lhs.isAppOf (Name.mkStr3 "Specimen" "CheckerSearch" "search") || lhs.isAppOf ``DecOpt.decOpt
-  for f in facts do
-    let fHead ← forallTelescope (← inferType f) fun ys _ => do
+  -- Through an instance, the relation its predicate is about: only a fact concluding that relation
+  -- can apply (tried against every fact, the unifications unfold the instances each time).
+  let rec lamBody : Expr → Expr
+    | .lam _ _ b _ => lamBody b
+    | e => e
+  let relOf (e : Expr) : Option Name :=
+    let e := lamBody e
+    let e := if e.isAppOfArity ``Exists 2 then lamBody (e.getArg! 1) else e
+    let e := lamBody e
+    e.getAppFn.constName?
+  let instRel : Option Name :=
+    if lhs.isAppOf ``DecOpt.decOpt then (lhs.getAppArgs[0]?).bind relOf
+    else none
+  -- A fact is about a call of a worker or an instance: a hypothesis whose head is a `match`, or no
+  -- constant at all, is reduced or split below, not matched (unifying it against every fact unfolds
+  -- both, the bulk of a checker's soundness proof)
+  let env ← getEnv
+  let skipFacts := match lhsHead with
+    | none => true
+    | some c => Lean.Meta.isMatcherCore env c
+  for f in (if skipFacts then #[] else facts) do
+    if viaInstance && instRel.isSome then
+      let concl ← forallTelescope (← inferType f) fun _ b => do return relOf (← instantiateMVars b)
+      if concl.isSome && concl != instRel then continue
+    -- a constant's head, once for all the leaves that read it
+    let computeHead : MetaM (Option Name) := forallTelescope (← inferType f) fun ys _ => do
       let some y := ys.back? | return none
       return headOf (← instantiateMVars (← inferType y))
+    let fHead ← match f.getAppFn.constName? with
+      | some c =>
+        if f.isConst then
+          match (← factHeadCache.get)[c]? with
+          | some h => pure h
+          | none => do
+            let h ← computeHead
+            factHeadCache.modify (·.insert c h)
+            pure h
+        else computeHead
+      | none => computeHead
     unless viaInstance || fHead.isNone || fHead == lhsHead do continue
     let saved ← saveState
     try
       let t ← inferType f
       let (xs, bis, _) ← forallMetaTelescopeReducing t
       let some hyp := xs.back? | throwError "no hyp"
-      unless ← timeIn "check_hyps.factUnify" (isDefEq (← inferType hyp) (← inferType fv)) do throwError "no"
+      let lbl := s!"check_hyps.factUnify.{(lhsHead.getD `none).getString!.take 40}/{(fHead.getD `none).getString!.take 30}"
+      unless ← timeIn lbl (isDefEq (← inferType hyp) (← inferType fv)) do throwError "no"
       -- the instances (an enumerator's laws for the types it draws) the match left open
       for (x, bi) in xs.zip bis do
         if bi.isInstImplicit && !(← x.mvarId!.isAssigned) then
@@ -310,8 +349,13 @@ syntax "check_hyps" (" [" term,* "]")? (" unfolding" " [" ident,* "]")? : tactic
 
 open Lean Elab Tactic in
 elab_rules : tactic | `(tactic| check_hyps $[[$fs,*]]? $[unfolding [$us,*]]?) => withMainContext do
+  -- `@c`, the common case, is the constant itself: elaborating hundreds of them at every leaf costs
+  -- more than the leaf
   let facts ← match fs with
     | some fs => fs.getElems.filterMapM fun f => do
+        if f.getKind == ``Lean.Parser.Term.explicit && f[1].isIdent then
+          try return some (← Meta.mkConstWithFreshMVarLevels (← realizeGlobalConstNoOverload f[1]))
+          catch _ => pure ()
         try return some (← Term.elabTerm f none) catch _ => return none
     | none => pure #[]
   let unfolds ← match us with

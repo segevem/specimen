@@ -31,7 +31,7 @@ namespace Verdict'
 theorem orElse_yes {a : Verdict} {b : Unit → Verdict} (h : Verdict.orElse a b = .yes) :
     a = .yes ∨ b () = .yes := by
   cases a <;> simp only [Verdict.orElse] at h
-  · cases h
+  · revert h; cases b () <;> simp
   · exact .inl rfl
   · exact .inr h
   · revert h; cases b () <;> simp

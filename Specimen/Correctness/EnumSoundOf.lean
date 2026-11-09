@@ -108,9 +108,29 @@ def proveSearchFindsParallel (ws : Array Name) (facts : Array Term) : CommandEla
   let factsAll : Syntax.TSepArray `term "," := Syntax.TSepArray.ofElems (ihs ++ facts)
   let block := ws[0]! ++ `searchFinds_block
   let named := (Array.range k).map fun i => (ws[i]!, stmts[i]!)
+  -- the enumerators' equations by `rfl`, as for their soundness (`proveCheckSoundParallel`): `unfold`
+  -- generates `W.eq_def`
+  -- (the equations hold at every monad, the searches' `Search` among them)
+  if (← IO.getEnv "SPECIMEN_BODY_NORFL").isNone then
+    for w in ws do
+      unless (← getEnv).contains (w ++ `eq_body) do
+        liftTermElabM <| try discard <| specimenBodyByRfl w catch _ => pure ()
+  let env ← getEnv
+  let unfoldBy (w : Name) (lem : Name) : CommandElabM (TSyntax `tactic) := do
+    if (← IO.getEnv "SPECIMEN_SEARCH_RW").isSome && env.contains (w ++ lem) then
+      if lem == `eq_body then
+        -- both sides of the relation, each its own instance of the equation (one `rw` rewrites
+        -- only the first's)
+        let e := mkIdent (w ++ lem)
+        let b := mkIdent (w ++ `body)
+        `(tactic| (rw [$e:ident]; (try rw [$e:ident]); delta $b:ident))
+      else
+        let e := mkIdent (w ++ lem)
+        `(tactic| (rw [$e:ident]; (try rw [$e:ident])))
+    else `(tactic| unfold $(mkIdent w):ident)
   proveBlockParallel named "searchFinds" block
-    (fun i => `(tactic| (intros; unfold $(mkIdent ws[i]!):ident; (try unfold_arbitrary); walk)))
-    (fun i => `(tactic| (intros; unfold $(mkIdent ws[i]!):ident; (try unfold_arbitrary); walk [$factsAll,*])))
+    (fun i => do `(tactic| (intros; $(← unfoldBy ws[i]! `eq_zero):tactic; (try unfold_arbitrary); walk)))
+    (fun i => do `(tactic| (intros; $(← unfoldBy ws[i]! `eq_body):tactic; (try unfold_arbitrary); walk [$factsAll,*])))
   liftTermElabM <| splitBlock block [] named `searchFinds
   return true
 

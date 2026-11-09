@@ -126,10 +126,23 @@ def proveCheckSoundParallel (items : Array (Name × Name)) (facts : Array Term)
     let mut ws : Array (Name × Expr × Option Name) := #[]
     for (wN, rN, outIdx) in gens do
       let (eqn, stmt) ← soundStatement wN rN outIdx (genEqn := false)
+      -- the enumerator's equations by `rfl` (`W.eq_zero`, `W.eq_body`): rewriting by `W.eq_def`
+      -- generates it, a proof by splitting every `match` of the body, as large as the body and
+      -- checked by the kernel on the thread that first needs it
+      if (← IO.getEnv "SPECIMEN_BODY_NORFL").isNone && !(← getEnv).contains (wN ++ `eq_body) then
+        try discard <| specimenBodyByRfl wN catch _ => pure ()
       ws := ws.push (wN, stmt, some eqn)
     for (wN, rN) in items do
       ws := ws.push (wN, ← checkStatement wN rN, none)
     return ws
+  let env ← getEnv
+  let rwZero (w eqn : Name) : CommandElabM (TSyntax `tactic) :=
+    if env.contains (w ++ `eq_zero) then `(tactic| rw [$(mkIdent (w ++ `eq_zero)):ident])
+    else `(tactic| rw [$(mkIdent eqn):ident])
+  let rwSucc (w eqn : Name) : CommandElabM (TSyntax `tactic) :=
+    if env.contains (w ++ `eq_body) then
+      `(tactic| (rw [$(mkIdent (w ++ `eq_body)):ident]; delta $(mkIdent (w ++ `body)):ident))
+    else `(tactic| rw [$(mkIdent eqn):ident])
   let lps := (ws.foldl (fun acc (w : Name × Expr × Option Name) => collectLevelParams acc w.2.1) {}).params.toList
   unless lps.isEmpty do return false
   let k := ws.size
@@ -150,13 +163,13 @@ def proveCheckSoundParallel (items : Array (Name × Name)) (facts : Array Term)
   proveBlockParallel stmts "checkSound" block
     (fun i => do
       match ws[i]!.2.2 with
-      | some eqn => `(tactic| (intros; rw [$(mkIdent eqn):ident]; walk))
+      | some eqn => do `(tactic| (intros; $(← rwZero ws[i]!.1 eqn):tactic; walk))
       | none => `(tactic| (intros; check_hyps unfolding [$ckIds,*])))
     (fun i => do
       match ws[i]!.2.2 with
-      | some eqn => `(tactic| (
+      | some eqn => do `(tactic| (
           intros
-          rw [$(mkIdent eqn):ident]
+          $(← rwSucc ws[i]!.1 eqn):tactic
           unfold_gen_instances [$factsGen,*]
           walk [$factsGen,*]
           all_goals ((try check_hyps [$factsGen,*]); ctor_leaf)))
@@ -166,7 +179,11 @@ def proveCheckSoundParallel (items : Array (Name × Name)) (facts : Array Term)
   return true
 
 initialize specimenCheckSoundHook.set <| some fun gens checkers sounds => do
-  let facts : Array Term := sounds.map fun n => ⟨mkNode ``Lean.Parser.Term.explicit #[mkAtom "@", mkIdent n]⟩
+  -- the hand-written instances' laws too (`@[specimen_sound]`), for the enumerators proved with the
+  -- checkers: a call of a hand-written enumerator is otherwise a value of which nothing is known
+  let tagged := (specimenSoundExt.getState (← getEnv)).toArray.filter (!sounds.contains ·)
+  let facts : Array Term := (sounds ++ tagged).map fun n =>
+    ⟨mkNode ``Lean.Parser.Term.explicit #[mkAtom "@", mkIdent n]⟩
   -- A budget, so that a checker `check_hyps` cannot read in reasonable time fails rather than stalls
   -- the derivation: the generators that need its law then fail, and the rest go on.
   let budget := ((← IO.getEnv "SPECIMEN_CHECK_HEARTBEATS").bind String.toNat?).getD 2000000

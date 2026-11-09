@@ -404,6 +404,9 @@ mutual
       | .Checker => `($(mkIdent ``Except.ok) $(mkIdent ``false))
     | .MRet e => do
       let e' ← mexpToTSyntax e deriveSort
+      if Lean.Option.get (← getOptions) specimen.plainBinds then
+        `($(mkIdent ``Pure.pure) $e')
+      else
       `(return $e')
     | .MBind monadSort m vars k => do
       -- Compile the monadic expression `m` and the continuation `k` to `TSyntax term`s
@@ -422,6 +425,9 @@ mutual
           else
             mkTuple vars
         -- If we have a producer, we can just produce a monadic bind
+        if Lean.Option.get (← getOptions) specimen.plainBinds then
+          `($(mkIdent ``Bind.bind) $m1:term (fun $compiledArgs:term => $k1:term))
+        else
         `(do let $compiledArgs:term ← $m1:term ; $k1:term)
       | .Generator, .Checker
       | .Enumerator, .Checker => do

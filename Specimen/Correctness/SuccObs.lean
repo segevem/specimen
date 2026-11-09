@@ -80,6 +80,24 @@ theorem le_succ_backtrack {gs : List (Nat × (Unit → SGen α))} {post : α →
   obtain ⟨p, hp, -, hx⟩ := produces_backtrack_ok gs x hx
   exact succ_forall_of_forall₂ h hcs p hp x hx
 
+theorem forall_mem_of_foldr_map {β : Type _} {P : β → Prop} :
+    ∀ {gs : List β}, (gs.map P).foldr And True → ∀ q ∈ gs, P q
+  | [], _, _, hq => absurd hq List.not_mem_nil
+  | _ :: _, h, q, hq => by
+    simp only [List.map_cons, List.foldr_cons] at h
+    rcases List.mem_cons.mp hq with rfl | hq
+    · exact h.1
+    · exact forall_mem_of_foldr_map h.2 q hq
+
+/-- A backtrack is sound when each of its alternatives is: the step of a derived worker, split by
+alternative (`proveBlockParallel`). -/
+theorem succ_spec_backtrack_of_all {gs : List (Nat × (Unit → SGen α))} {post : α → Prop}
+    (h : (gs.map fun p => succObs.spec (p.2 ()) post).foldr And True) :
+    succObs.spec (Specimen.Backtrack.backtrack gs) post := by
+  intro x hx
+  obtain ⟨p, hp, -, hx⟩ := produces_backtrack_ok gs x hx
+  exact forall_mem_of_foldr_map (P := fun p => succObs.spec (p.2 ()) post) h p hp x hx
+
 @[gen_rule]
 theorem le_succ_optGen_some {q : Nat × (Unit → SGen α)} {post : α → Prop} {c : Prop}
     (h : c ≤ succObs.spec (q.2 ()) post) : c ≤ succObs.spec (optGen (some q)) post := h

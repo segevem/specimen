@@ -706,6 +706,10 @@ def getProducerScheduleForInductiveConstructor
   getScheduleForInductiveRelationConstructor inductiveName ctorName inputNames deriveSort (some outputNamesTypesIndices) unknowns localCtx recFnName depMemo memoRef deriveDep
 
 
+/-- The folds `precomputeWeight` made so far, by their input (the weight term, names to unfold and
+binders, printed): the same constructor's weight recurs in every mode of its relation. -/
+initialize weightFoldCache : IO.Ref (Std.HashMap String (TSyntax `term × Bool)) ← IO.mkRef {}
+
 /-- When `specimen.precomputeWeights` is set, partially evaluate a constructor weight
     expression under the runtime `size` binder. `finalWeight` is a term mentioning the
     runtime size variable `sizePrimeName` and, otherwise, only literals baked in at
@@ -733,6 +737,15 @@ private def precomputeWeight (finalWeight : TSyntax `term) (sizePrimeName : Name
     TermElabM (TSyntax `term × Bool) := do
   unless Lean.Option.get (← getOptions) specimen.precomputeWeights do
     return (finalWeight, false)
+  let key := s!"{finalWeight.raw.prettyPrint}|{sizePrimeName}|{unfoldNames}|{extraBinder}|{← getCurrNamespace}"
+  if let some r := (← weightFoldCache.get)[key]? then return r
+  let t0 ← IO.monoMsNow
+  let r ← precomputeWeightCore finalWeight sizePrimeName unfoldNames extraBinder
+  timerLog s!"  weightfold {(← IO.monoMsNow) - t0} ms {key.take 80}"
+  weightFoldCache.modify (·.insert key r)
+  return r
+where precomputeWeightCore (finalWeight : TSyntax `term) (sizePrimeName : Name)
+    (unfoldNames : List Name) (extraBinder : Option Name) : TermElabM (TSyntax `term × Bool) := do
   try
     withLocalDeclD sizePrimeName (mkConst ``Nat) fun _ => do
     -- `extraBinder` is bound the same way, so a term mentioning it elaborates and the residual
@@ -746,6 +759,16 @@ private def precomputeWeight (finalWeight : TSyntax `term) (sizePrimeName : Name
       Term.synthesizeSyntheticMVarsNoPostponing
       let e ← instantiateMVars e
       if e.hasMVar then return (finalWeight, false)
+      -- Unfold the weight definitions and reduce the matches on what is closed first: a `match` on the
+      -- constructor's name with string patterns `simp` decides one pattern at a time, the fall-through
+      -- case in over a second, where reducing the matcher compares the literals directly.
+      let e ← Meta.transform e (pre := fun x => do
+        if let some c := x.getAppFn.constName? then
+          if unfoldNames.contains c then
+            if let some x' ← unfoldDefinition? x then return .visit x'.headBeta
+        match ← reduceMatcher? x with
+        | .reduced x' => return .visit x'.headBeta
+        | _ => return .continue)
       let mut thms : SimpTheorems ← getSimpTheorems
       for n in unfoldNames do
         thms ← thms.addDeclToUnfold n
@@ -1781,6 +1804,7 @@ partial def deriveBestInductiveSchedule (key : SpecKey)
 
   -- 3. Insert inProgress placeholder (cycle detection)
   memo.modify (·.insert key .inProgress)
+  withMemoProvenance key do
   let startTime ← IO.monoNanosNow
 
   -- 4. Derive schedules for each constructor
@@ -2284,6 +2308,14 @@ def deriveFromScheduleDep (dep : ScheduleDep) (scheduleRewriter : List ScheduleS
       dep.inductiveName indLevels freshArgIdents freshenedOutputNames.toList
       outTypes.toList producerSort localCtx
 
+/-- A generated `def` or `instance` command marked `noncomputable`, in its modifiers. -/
+def markNoncomputable (cmd : TSyntax `command) : TSyntax `command :=
+  let raw := cmd.raw
+  if raw.getKind != ``Lean.Parser.Command.declaration then cmd else
+  let mods := raw[0]
+  let mods := mods.setArg 4 (mkNullNode #[mkNode ``Lean.Parser.Command.noncomputable #[mkAtom "noncomputable"]])
+  ⟨raw.setArg 0 mods⟩
+
 /-- Rewrites a generated `instance` command to use `scoped instance` or `local instance`
     by patching the `attrKind` node in the syntax tree (declaration → instance → attrKind). -/
 def setInstanceVisibility (cmd : TSyntax `command) (kind : AttributeKind) : TSyntax `command :=
@@ -2536,12 +2568,67 @@ private def timerLine (line : String) : CommandElabM Unit := do
   logInfo line
   timerLog line
 
+/-- A call of a soundness hook, recorded by `specimen.deferSound` for `#specimen_sound_replay`: a
+component's generators (or enumerators, proved like them), its enumerators' searches, or its
+checkers with the enumerators of their block. -/
+inductive SoundCall where
+  | gens (gs : Array (Name × Name × List Nat))
+  | search (ens : Array Name)
+  | check (withEns : Array (Name × Name × List Nat)) (cks : Array (Name × Name))
+  deriving Inhabited
+
+/-- The soundness steps `specimen.deferSound` recorded, in order. -/
+initialize specimenSoundCallsExt : SimplePersistentEnvExtension SoundCall (Array SoundCall) ←
+  registerSimplePersistentEnvExtension {
+    addEntryFn := fun s e => s.push e
+    addImportedFn := fun as => as.foldl (· ++ ·) #[] }
+
+/-- Run a recorded soundness step, with the theorems proved so far. -/
+def runSoundCall (c : SoundCall) (soundNames : Array Name) : CommandElabM Unit := do
+  match c with
+  | .gens gs => if let some h ← specimenSoundHook.get then h gs soundNames
+  | .search ens => if let some h ← specimenEnumSoundHook.get then h ens soundNames
+  | .check w cks => if let some h ← specimenCheckSoundHook.get then h w cks soundNames
+
+/-- The theorems a soundness step proves, those it did. -/
+def soundCallNames (c : SoundCall) (env : Environment) : Array Name :=
+  let ws : Array Name := match c with
+    | .gens gs => gs.map (·.1)
+    | .search ens => ens
+    | .check w cks => w.map (·.1) ++ cks.map (·.1)
+  let cands := ws.foldl (fun acc w => acc ++ #[w ++ `sound, w ++ `checkSound, w ++ `searchFinds,
+    w ++ `searchSound]) #[]
+  cands.filter env.contains
+
+/-- `#specimen_sound_replay`: the soundness steps an imported `derive_mutual` recorded
+(`specimen.deferSound`), run here in order. -/
+syntax "#specimen_sound_replay" : command
+
+elab_rules : command
+  | `(#specimen_sound_replay) => do
+    let calls := specimenSoundCallsExt.getState (← getEnv)
+    let mut soundNames : Array Name := #[]
+    for (n, _) in (← getEnv).constants.map₁.toList ++ (← getEnv).constants.map₂.toList do
+      match n with
+      | .str (.str _ w) suffix =>
+        if (suffix == "sound" || suffix == "checkSound" || suffix == "searchSound" || suffix == "searchFinds") &&
+            (w.startsWith "specimen_gen_" || w.startsWith "specimen_enum_" || w.startsWith "specimen_check_") then
+          soundNames := soundNames.push n
+      | _ => pure ()
+    for c in calls do
+      runSoundCall c soundNames
+      for n in soundCallNames c (← getEnv) do
+        unless soundNames.contains n do soundNames := soundNames.push n
+
 /-- Emit compiled SCC components: each multi-def component as a single `mutual … end`
     block, single defs directly, followed by their instances at the given visibility. -/
 def emitSpecComponents
     (compiledComponents : Array (Array (SpecKey × Name) × Array (TSyntax `command) × Array (TSyntax `command)))
     (attrKind : AttributeKind) (rootNames : List Name := []) : CommandElabM Unit := do
   let basalt := Lean.Option.get (← getOptions) specimen.emitBasalt
+  let deferSound := Lean.Option.get (← getOptions) specimen.deferSound
+  let dispatch (c : SoundCall) (names : Array Name) : CommandElabM Unit :=
+    if deferSound then modifyEnv (specimenSoundCallsExt.addEntry · c) else runSoundCall c names
   let sound ← if basalt && Lean.Option.get (← getOptions) specimen.emitSound then
       match ← specimenSoundHook.get with
       | some hook => pure (some hook)
@@ -2561,7 +2648,7 @@ def emitSpecComponents
   -- The laws of producers an earlier command derived, possibly in another namespace or module: a
   -- component that reuses its instance calls its worker, whose name this command cannot predict.
   if sound.isSome then
-    for (n, _) in (← getEnv).constants.map₁.toList do
+    for (n, _) in (← getEnv).constants.map₁.toList ++ (← getEnv).constants.map₂.toList do
       match n with
       | .str (.str _ w) suffix =>
         if (suffix == "sound" || suffix == "checkSound" || suffix == "searchSound") &&
@@ -2588,13 +2675,21 @@ def emitSpecComponents
               Deriving one instead; to keep the hand-written generator, give it a `BacktrackGenFor` \
               counterpart."
     let tDef ← IO.monoNanosNow
+    let nc := Lean.Option.get (← getOptions) specimen.noncomputableDefs
+    let defCmds := if nc then defCmds.map markNoncomputable else defCmds
+    -- (no info trees for the derived code: the whole derivation is one command, whose trees would
+    -- grow with every component, and nothing reads them)
+    let noInfo := (← IO.getEnv "SPECIMEN_DEFS_INFO").isNone
+    let elabC (c : TSyntax `command) : CommandElabM Unit :=
+      if noInfo then withEnableInfoTree false (elabCommand c) else elabCommand c
     if defCmds.size > 1 then
-      elabCommand (← `(command| mutual $defCmds* end))
+      elabC (← `(command| mutual $defCmds* end))
     else
-      elabCommand defCmds[0]!
+      elabC defCmds[0]!
     let tInst ← IO.monoNanosNow
     for instCmd in instCmds do
-      elabCommand (setInstanceVisibility instCmd attrKind)
+      let c := setInstanceVisibility instCmd attrKind
+      elabC (if nc then markNoncomputable c else c)
     if sound.isSome && Lean.Option.get (← getOptions) specimen.reportPhaseTimers then
       timerLog s!"  defs {compMeta.toList.map (·.1.inductiveName)} ({defCmds.size}): {((← IO.monoNanosNow) - tDef) / 1000000} ms (defs {(tInst - tDef) / 1000000}, instances {((← IO.monoNanosNow) - tInst) / 1000000})"
   -- Proving in parallel, every definition first: adding one waits for the kernel to have checked every
@@ -2624,7 +2719,8 @@ def emitSpecComponents
         return (← declared w, k.inductiveName, k.outputIndices)
       let ens ← ens.filterM fun (w, _, _) => return !(← getEnv).contains (w ++ `sound)
       unless ens.isEmpty do
-        hook ens soundNames
+        let _ := hook
+        dispatch (.gens ens) soundNames
         for (w, _, _) in ens do
           if (← getEnv).contains (w ++ `sound) then soundNames := soundNames.push (w ++ `sound)
     if let some hook := sound then
@@ -2635,7 +2731,8 @@ def emitSpecComponents
         if Lean.Option.get (← getOptions) specimen.reportPhaseTimers then
           timerLog s!"▶ sound {gens.toList.map (·.2.1)} ({soundNames.size} facts)"
         let t0 ← IO.monoNanosNow
-        hook gens soundNames
+        let _ := hook
+        dispatch (.gens gens) soundNames
         if Lean.Option.get (← getOptions) specimen.reportPhaseTimers then
           let proved := (← getEnv).contains (gens[0]!.1 ++ `sound)
           timerLine s!"⏱ sound {gens[0]!.2.1} ({gens.size} workers): {((← IO.monoNanosNow) - t0) / 1000000} ms{if proved then "" else " NOT PROVED"}"
@@ -2647,7 +2744,8 @@ def emitSpecComponents
         let ens ← ens.filterM fun w => return !(← getEnv).contains (w ++ `searchFinds)
         unless ens.isEmpty do
           let t0 ← IO.monoNanosNow
-          hook ens soundNames
+          let _ := hook
+          dispatch (.search ens) soundNames
           if Lean.Option.get (← getOptions) specimen.reportPhaseTimers then
             let proved := (← getEnv).contains (ens[0]! ++ `searchFinds)
             timerLine s!"⏱ search {ens[0]!} ({ens.size} workers): {((← IO.monoNanosNow) - t0) / 1000000} ms{if proved then "" else " NOT PROVED"}"
@@ -2668,7 +2766,8 @@ def emitSpecComponents
           else pure #[]
         unless cks.isEmpty do
           let t0 ← IO.monoNanosNow
-          hook withEns cks soundNames
+          let _ := hook
+          dispatch (.check withEns cks) soundNames
           if Lean.Option.get (← getOptions) specimen.reportPhaseTimers then
             let proved := (← getEnv).contains (cks[0]!.1 ++ `checkSound)
             timerLine s!"⏱ check {cks[0]!.2} ({cks.size} workers): {((← IO.monoNanosNow) - t0) / 1000000} ms{if proved then "" else " NOT PROVED"}"
@@ -2681,7 +2780,8 @@ def emitSpecComponents
             if let some eh ← specimenEnumSoundHook.get then
               let ens ← (compMeta.filter fun (k, _) => k.deriveSort == .Enumerator).mapM fun (_, w) => declared w
               let ens ← ens.filterM fun w => return !(← getEnv).contains (w ++ `searchSound)
-              unless ens.isEmpty do eh ens soundNames
+              let _ := eh
+              unless ens.isEmpty do dispatch (.search ens) soundNames
               for w in ens do
                 if (← getEnv).contains (w ++ `searchSound) then soundNames := soundNames.push (w ++ `searchSound)
     if Lean.Option.get (← getOptions) specimen.deriveFloors && sound.isSome then
@@ -2698,7 +2798,9 @@ def emitSpecComponents
             let proved := (← getEnv).contains (gens[0]!.1 ++ `floorSound)
             timerLine s!"⏱ floor {gens[0]!.2.1} ({gens.size} workers): {((← IO.monoNanosNow) - t0) / 1000000} ms{if proved then "" else " NOT PROVED"}"
     if let some hook := complete then
-      let gens ← (compMeta.filter fun (k, _) => k.deriveSort == .Generator).mapM fun (k, w) =>
+      let allSorts := Lean.Option.get (← getOptions) specimen.completeAllSorts
+      let gens ← (compMeta.filter fun (k, _) => k.deriveSort == .Generator ||
+          (allSorts && (k.deriveSort == .Enumerator || k.deriveSort == .Checker))).mapM fun (k, w) =>
         return (← declared w, k.inductiveName, k.outputIndices)
       let gens ← gens.filterM fun (w, _, _) => return !(← getEnv).contains (w ++ `complete)
       unless gens.isEmpty do hook gens
@@ -2758,6 +2860,27 @@ def elabDeriveMutual : CommandElab := fun stx => do
         for (indName, outIdxs, _, ds) in specMeta do
           let key : SpecKey := { inductiveName := indName, outputIndices := outIdxs, deriveSort := ds }
           let _ ← liftTermElabM <| deriveBestInductiveSchedule key memo
+        -- `specimen.cycleFixpoint`: a cycle's members were chosen against a placeholder for the mode
+        -- then in progress, and its root against them; re-derive them all, each reading the others
+        -- at their derived scores, until no score changes.
+        let rounds := Lean.Option.get (← getOptions) specimen.cycleFixpoint
+        for round in [:rounds] do
+          let keys := (← (memoCycleLow.get : IO _)).toList.map (·.1) ++ (← (memoCycleRoots.get : IO _)).toList
+          if keys.isEmpty then break
+          (memoCycleLow.set {} : IO Unit)
+          (memoCycleRoots.set {} : IO Unit)
+          let before ← memo.get
+          let fp (e : Option MemoEntry) : String := match e with
+            | some (.done s) => toString (s.ctorStats.map fun (n, _, _, sc) => (n, sc.reprFn sc.val))
+            | _ => "-"
+          let mut changed : Array SpecKey := #[]
+          for k in keys do
+            memo.modify (·.erase k)
+            let _ ← liftTermElabM <| deriveBestInductiveSchedule k memo
+            if fp before[k]? != fp (← memo.get)[k]? then changed := changed.push k
+          logInfo m!"specimen.cycleFixpoint: round {round + 1}: {keys.length} re-derived, \
+            {changed.size} changed{if changed.isEmpty then "" else s!": {changed.toList.map fun k => s!"{k.inductiveName}{k.outputIndices}"}"}"
+          if changed.isEmpty then break
         let tSearch ← IO.monoMsNow
         -- DFS from roots to find actually-used deps
         let finalMemo ← memo.get

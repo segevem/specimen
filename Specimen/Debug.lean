@@ -45,6 +45,13 @@ register_option specimen.multiOutput : Bool := {
 
     Generators only: enumerators and checkers keep their concrete fuel-indexed types.
     See `Docs/Specimen-Basalt-port.md`. -/
+register_option specimen.plainBinds : Bool := {
+  defValue := false
+  descr := "emit a derived worker's binds and returns as `Bind.bind m fun x => k` and `Pure.pure e` \
+    rather than `do` notation: the same code without the `do` elaborator's cost, and without the \
+    trivial `match` on a variable a typed `do` binding elaborates to"
+}
+
 register_option specimen.emitBasalt : Bool := {
   defValue := false
   descr := "emit derived generators against Basalt's `Gen` algebra instead of `Plausible.Gen`"
@@ -147,6 +154,58 @@ register_option specimen.emitComplete : Bool := {
   descr := "prove derived generators complete (needs Specimen.Correctness.CompleteOf)"
 }
 
+register_option specimen.deferComplete : Bool := {
+  defValue := false
+  descr := "with specimen.emitComplete, record each component's generators instead of proving them \
+    complete, for `#specimen_complete_*` commands in files that import this one: completeness split \
+    across files, which Lean checks in parallel (within a file, its kernel checks run one at a time)"
+}
+
+register_option specimen.completeDropUnreachable : Bool := {
+  defValue := false
+  descr := "the completeness parts' walks drop the branches that cannot return the case's value \
+    (`basalt.walk.dropUnreachable`)"
+}
+
+register_option specimen.reachSimpAll : Bool := {
+  defValue := true
+  descr := "`reach_close` tries `simp_all` last on a check's premise (costly; rarely what closes it)"
+}
+
+register_option specimen.searchSeparately : Bool := {
+  defValue := false
+  descr := "with specimen.completeAllSorts, the completeness blocks do not prove the enumerators' \
+    searches (`searchHits`): `#specimen_prove_all_but` does, before them"
+}
+
+register_option specimen.completeAllSorts : Bool := {
+  defValue := false
+  descr := "with specimen.emitComplete, prove the derived enumerators and checkers complete too, not \
+    only the generators: each enumerator's `complete` and its searches' `searchHits`/`searchTotal`, each \
+    checker's `complete`, and their instances' `EnumForComplete`, `EnumForSearch` and `DecOptComplete`"
+}
+
+register_option specimen.skipFailedParts : Bool := {
+  defValue := false
+  descr := "a slice of a component's completeness parts declares only the parts it proves, each \
+    proved in a task of its own; the rest are left to `#specimen_prove_finish`, in a file that \
+    imports more (no part is admitted)"
+}
+
+register_option specimen.admitFailedParts : Bool := {
+  defValue := false
+  descr := "a completeness part whose proof fails (or runs out of heartbeats) is admitted with `sorry` \
+    and a warning rather than an error, so that the file still compiles (`lean -o` writes no `.olean` \
+    for a file with errors); the theorems that use it then depend on `sorryAx`, as they would anyway"
+}
+
+register_option specimen.deferSound : Bool := {
+  defValue := false
+  descr := "with specimen.emitSound, record the soundness proofs' steps instead of running them, for \
+    `#specimen_sound_replay` in a file that imports this one (soundness proved alongside the files \
+    that prove completeness, rather than before them)"
+}
+
 /-- What `specimen.emitComplete` runs on each derived component's generators, as (worker, relation,
     output indices). Set by `Specimen.Correctness.CompleteOf`. -/
 initialize specimenCompleteHook :
@@ -185,6 +244,31 @@ register_option specimen.richOutput : Bool := {
 register_option specimen.textOutput : Nat := {
   defValue := 0
   descr := "plain-text output verbosity (0=off, 1=summary, 2=problems, 3=full)"
+}
+
+register_option specimen.prefixSearch : Bool := {
+  defValue := false
+  descr := "search premise orders with the prefix explorer (every order reachable, committed prefixes, \
+    sleep-set reduction) instead of the insertion tree"
+}
+
+register_option specimen.cycleFixpoint : Nat := {
+  defValue := 0
+  descr := "after deriving, re-derive the modes of each cycle (and its root), whose schedules were \
+    chosen against a placeholder for a mode then in progress, with every other mode at its derived \
+    score, up to this many rounds or until no schedule's score changes (0: off)"
+}
+
+register_option specimen.noncomputableDefs : Bool := {
+  defValue := false
+  descr := "emit the derived definitions and instances `noncomputable` (no compiled code; for \
+    checking proofs only)"
+}
+
+register_option specimen.prefixFullFootprint : Bool := {
+  defValue := false
+  descr := "in the prefix explorer, take two premises as independent when they share no unbound \
+    variable anywhere in their arguments, not only when both are plain relations"
 }
 
 /-- Maximum number of hypothesis orderings to evaluate per constructor before
@@ -360,3 +444,7 @@ def Specimen.floorArgPositions (env : Lean.Environment) (w : Lean.Name) : Option
   let v ← ci.value?
   let (_, xs) ← v.listLit?
   xs.mapM fun x => x.nat? <|> x.rawNatLit?
+
+/-- `#specimen_tactic_times`: the totals of `timeIn` so far (`SPECIMEN_TACTIC_TIMES`), to the timer
+log, reset. -/
+elab "#specimen_tactic_times" : command => do reportTacticTimes "all"

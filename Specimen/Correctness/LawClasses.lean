@@ -50,10 +50,23 @@ theorem ok (h : ¬ P) {s : Nat} (hs : bound h ≤ s) : DecOpt.decOpt (P := P) s 
   Classical.choose_spec (refute h) s hs
 end DecOptRefuteComplete
 
-/-- A decidable premise is checked by deciding it. -/
-instance {P : Prop} [Decidable P] : DecOptComplete P := ⟨fun h => ⟨0, fun _ _ => by simp [DecOpt.decOpt, h]⟩⟩
-instance {P : Prop} [Decidable P] : DecOptRefuteComplete P :=
-  ⟨fun h => ⟨0, fun _ _ => by simp [DecOpt.decOpt, h]⟩⟩
+/-- A premise that holds is checked true at every size: a check that does not use its size. Its
+completeness needs no bound, so a generator's proof chooses none for it. -/
+class DecOptCompleteAll (P : Prop) [DecOpt P] : Prop where
+  ok : P → ∀ s, DecOpt.decOpt (P := P) s = .ok true
+
+/-- A premise that fails is checked false at every size. -/
+class DecOptRefuteCompleteAll (P : Prop) [DecOpt P] : Prop where
+  ok : ¬ P → ∀ s, DecOpt.decOpt (P := P) s = .ok false
+
+instance (priority := low) {P : Prop} [DecOpt P] [DecOptCompleteAll P] : DecOptComplete P :=
+  ⟨fun h => ⟨0, fun s _ => DecOptCompleteAll.ok h s⟩⟩
+instance (priority := low) {P : Prop} [DecOpt P] [DecOptRefuteCompleteAll P] : DecOptRefuteComplete P :=
+  ⟨fun h => ⟨0, fun s _ => DecOptRefuteCompleteAll.ok h s⟩⟩
+
+/-- A decidable premise is checked by deciding it, at every size. -/
+instance {P : Prop} [Decidable P] : DecOptCompleteAll P := ⟨fun h _ => by simp [DecOpt.decOpt, h]⟩
+instance {P : Prop} [Decidable P] : DecOptRefuteCompleteAll P := ⟨fun h _ => by simp [DecOpt.decOpt, h]⟩
 
 namespace BacktrackGenForComplete
 

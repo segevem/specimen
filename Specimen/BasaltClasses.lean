@@ -169,8 +169,11 @@ instance : ArbitrarySized (Fin (n + 1)) := ⟨fun _ => do
 /-- `-n` to `n`. -/
 instance : ArbitrarySized Int := ⟨fun n => do pure ((← chooseNat 0 (2 * n) : Nat) - (n : Int))⟩
 
-/-- Printable ASCII, `' '` through `'~'`, at every size. -/
-instance : ArbitrarySized Char := ⟨fun _ => do pure (Char.ofNat (← chooseNat 32 126))⟩
+/-- Mostly printable ASCII, `' '` through `'~'`; rarely any Unicode scalar value, so that every
+character can be drawn. At every size. -/
+instance : ArbitrarySized Char := ⟨fun _ => frequency
+  [(19, fun _ => do pure (Char.ofNat (← chooseNat 32 126))),
+   (1, fun _ => do pure (Char.ofNat (← chooseNat 0 0x10FFFF)))]⟩
 
 instance [ArbitrarySized α] : ArbitrarySized (Option α) where
   arbitrarySized n := oneOf [fun () => pure none, fun () => some <$> ArbitrarySized.arbitrarySized n]
